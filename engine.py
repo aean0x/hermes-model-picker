@@ -1,4 +1,4 @@
-"""model-classifier — handoff context engine.
+"""model-picker — handoff context engine.
 
 A transparent subclass of Hermes's built-in ``ContextCompressor`` that adds two
 capabilities:
@@ -27,12 +27,13 @@ from typing import Any
 
 from agent.context_compressor import ContextCompressor
 
-ENGINE_NAME = "model-classifier"
-# Pre-rename engine name. `context.engine` in the Hermes config selects this
-# engine by name, and only one context engine may be registered — so a
-# deployment whose config still says "model-router" must keep working. The
-# instance advertises whichever of the two names the host config asks for.
-LEGACY_ENGINE_NAME = "model-router"
+ENGINE_NAME = "model-picker"
+# Earlier generations of this engine's name. `context.engine` in the Hermes
+# config selects the engine by name, and only one context engine may be
+# registered — so a deployment whose config still says "model-classifier" or
+# "model-router" must keep working. The instance advertises whichever known
+# name the host config asks for.
+LEGACY_ENGINE_NAMES = ("model-classifier", "model-router")
 
 
 def resolve_engine_name() -> str:
@@ -40,7 +41,7 @@ def resolve_engine_name() -> str:
 
     Falls back to the canonical name when the config names nothing or names a
     different engine. This keeps an un-edited config.yaml working across the
-    rename without silently dropping the handoff engine.
+    renames without silently dropping the handoff engine.
     """
     try:
         from hermes_cli.config import read_raw_config
@@ -54,7 +55,8 @@ def resolve_engine_name() -> str:
         wanted = str(context.get("engine") or "").strip()
     elif isinstance(context, str):
         wanted = context.strip()
-    return wanted if wanted in (ENGINE_NAME, LEGACY_ENGINE_NAME) else ENGINE_NAME
+    known = (ENGINE_NAME, *LEGACY_ENGINE_NAMES)
+    return wanted if wanted in known else ENGINE_NAME
 
 
 # Fallback tail budget if the settings module cannot be loaded (roughly 16k
@@ -101,7 +103,7 @@ def _format_handoff(handoff: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-class ModelClassifierContextEngine(ContextCompressor):
+class ModelPickerContextEngine(ContextCompressor):
     """Built-in compressor plus a request-scoped escalation handoff."""
 
     @property

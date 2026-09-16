@@ -1,4 +1,4 @@
-"""model-classifier settings — three named tiers (low < default < high).
+"""model-picker settings — three named tiers (low < default < high).
 
 This module does not own model IDs. Slot names are low/default/high.
 "medium" is the deprecated alias for "default" (the v0.8 lexicon) and is
@@ -6,13 +6,14 @@ still accepted in config keys, MODEL_CLASSIFIER_MEDIUM_* env, and
 pin/classifier tokens. Labels and `best_for` default from
 config.default.json. Model id and provider come from, in order:
 config.default.json, config.json (Nix `hermesPnP.models`), a
-MODEL_CLASSIFIER_CONFIG path, MODEL_CLASSIFIER_* env — and, if none of those
+MODEL_PICKER_CONFIG path, MODEL_PICKER_* env — and, if none of those
 name a model, the host's own primary model (`model.default` in the Hermes
 config) for all three tiers. No Hermes/WebUI core files are edited.
 
-Env names are canonical `MODEL_CLASSIFIER_*`. The pre-rename `MODEL_ROUTER_*`
-names still work (legacy alias) so an existing deployment keeps its config;
-canonical wins when both are set.
+Env names are canonical `MODEL_PICKER_*`. Both earlier generations still work
+as legacy aliases — `MODEL_CLASSIFIER_*` (the 0.10 name) and `MODEL_ROUTER_*`
+(the original) — so an existing deployment keeps its configuration; the
+canonical name wins when more than one is set.
 
 The `best_for` list on each tier is the source of truth for the
 classifier prompt. A short steer block (prefer-low on doubt; high is
@@ -35,7 +36,7 @@ RANK: dict[str, int] = {"low": 0, "default": 1, "high": 2}
 
 # Deprecated tier token. Accepted everywhere a tier name is accepted and
 # always resolves to the canonical "default" slot, so a v0.8 consumer
-# config (keys, MODEL_CLASSIFIER_MEDIUM_* env, /medium pin) keeps working.
+# config (keys, MODEL_PICKER_MEDIUM_* env, /medium pin) keeps working.
 LEGACY_NAMES: dict[str, str] = {"medium": "default"}
 _ALIASES: dict[str, str] = {**LEGACY_NAMES, **{n: n for n in NAMES}}
 
@@ -53,12 +54,18 @@ _ENV_SLOTS: tuple[tuple[str, str], ...] = (
     ("default", "MODEL_CLASSIFIER_MEDIUM_"),
     ("default", "MODEL_CLASSIFIER_DEFAULT_"),
     ("high", "MODEL_CLASSIFIER_HIGH_"),
+    ("low", "MODEL_PICKER_LOW_"),
+    ("default", "MODEL_PICKER_MEDIUM_"),
+    ("default", "MODEL_PICKER_DEFAULT_"),
+    ("high", "MODEL_PICKER_HIGH_"),
 )
 
-# Knobs read outside the per-slot loop: canonical name, then legacy alias.
+# Knobs read outside the per-slot loop: canonical name first, then the two
+# legacy generations (model-classifier, then the original model-router).
 _ENV_ALIASES: dict[str, tuple[str, ...]] = {
-    "CONFIG": ("MODEL_CLASSIFIER_CONFIG", "MODEL_ROUTER_CONFIG"),
+    "CONFIG": ("MODEL_PICKER_CONFIG", "MODEL_CLASSIFIER_CONFIG", "MODEL_ROUTER_CONFIG"),
     "CLASSIFIER_TIMEOUT_S": (
+        "MODEL_PICKER_CLASSIFIER_TIMEOUT_S",
         "MODEL_CLASSIFIER_CLASSIFIER_TIMEOUT_S",
         "MODEL_ROUTER_CLASSIFIER_TIMEOUT_S",
     ),
@@ -67,7 +74,14 @@ _ENV_ALIASES: dict[str, tuple[str, ...]] = {
 
 def env_knob(name: str) -> str | None:
     """First non-empty value among a knob's env names (canonical first)."""
-    for key in _ENV_ALIASES.get(name, (f"MODEL_CLASSIFIER_{name}", f"MODEL_ROUTER_{name}")):
+    for key in _ENV_ALIASES.get(
+        name,
+        (
+            f"MODEL_PICKER_{name}",
+            f"MODEL_CLASSIFIER_{name}",
+            f"MODEL_ROUTER_{name}",
+        ),
+    ):
         raw = os.environ.get(key)
         if raw is not None and str(raw).strip():
             return str(raw)
@@ -139,7 +153,7 @@ DEFAULT_PROVIDER_HOSTS: dict[str, dict[str, list[str]]] = {
 
 
 class SettingsError(ValueError):
-    """Invalid model-classifier configuration."""
+    """Invalid model-picker configuration."""
 
 
 def as_name(raw: Any) -> str | None:
@@ -186,12 +200,12 @@ def _coerce_models_map(raw: Any, *, origin: str) -> dict[str, dict[str, Any]]:
             out[name] = dict(meta)
     if extra:
         raise SettingsError(
-            f"model-classifier: {origin} declares unknown models {extra}; "
+            f"model-picker: {origin} declares unknown models {extra}; "
             "only low, default, high are allowed"
         )
     if len(raw) > 3 or len(out) > 3:
         raise SettingsError(
-            f"model-classifier: {origin} declares {len(raw)} models; exactly 3 are allowed"
+            f"model-picker: {origin} declares {len(raw)} models; exactly 3 are allowed"
         )
     return out
 
@@ -274,7 +288,7 @@ def _apply_file(data: dict[str, Any], state: dict[str, Any], *, origin: str) -> 
             errors[name] = int(val)
         if extra:
             raise SettingsError(
-                f"model-classifier: {origin}.escalation_errors has unknown keys {extra}; "
+                f"model-picker: {origin}.escalation_errors has unknown keys {extra}; "
                 "only low, default, high are allowed"
             )
         state["escalation_errors"] = errors
@@ -314,7 +328,7 @@ def load_settings() -> dict[str, Any]:
     for candidate, origin in (
         (_CATALOG_PATH, "config.default.json"),
         (_PLUGIN_DIR / "config.json", "config.json"),
-        (Path(config_env) if config_env else None, "MODEL_CLASSIFIER_CONFIG"),
+        (Path(config_env) if config_env else None, "MODEL_PICKER_CONFIG"),
     ):
         if candidate is None:
             continue
@@ -326,10 +340,10 @@ def load_settings() -> dict[str, Any]:
     extra = [name for name in models if name not in RANK]
     if extra:
         raise SettingsError(
-            f"model-classifier: unknown models {extra}; only low, default, high are allowed"
+            f"model-picker: unknown models {extra}; only low, default, high are allowed"
         )
     if len(models) > 3:
-        raise SettingsError("model-classifier: a fourth model is not allowed")
+        raise SettingsError("model-picker: a fourth model is not allowed")
 
     for name, prefix in _ENV_SLOTS:
         model = os.environ.get(prefix + "MODEL")

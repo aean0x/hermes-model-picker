@@ -1,4 +1,4 @@
-"""Unit tests for model-classifier settings (no Hermes)."""
+"""Unit tests for model-picker settings (no Hermes)."""
 
 from __future__ import annotations
 
@@ -16,21 +16,25 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 _OOBE_IDS = ROOT / "tests" / "oobe-ids.json"
 
-_ENV_KEYS = (
-    "MODEL_ROUTER_CONFIG",
-    "MODEL_ROUTER_LOW_MODEL",
-    "MODEL_ROUTER_LOW_PROVIDER",
-    "MODEL_ROUTER_LOW_BEST_FOR",
-    "MODEL_ROUTER_DEFAULT_MODEL",
-    "MODEL_ROUTER_MEDIUM_MODEL",
-    "MODEL_ROUTER_HIGH_MODEL",
-    "MODEL_CLASSIFIER_CONFIG",
-    "MODEL_CLASSIFIER_LOW_MODEL",
-    "MODEL_CLASSIFIER_LOW_PROVIDER",
-    "MODEL_CLASSIFIER_DEFAULT_MODEL",
-    "MODEL_CLASSIFIER_DEFAULT_PROVIDER",
-    "MODEL_CLASSIFIER_HIGH_MODEL",
-    "MODEL_CLASSIFIER_CLASSIFIER_TIMEOUT_S",
+_SUFFIXES = (
+    "CONFIG",
+    "LOW_MODEL",
+    "LOW_PROVIDER",
+    "LOW_LABEL",
+    "LOW_BEST_FOR",
+    "DEFAULT_MODEL",
+    "DEFAULT_PROVIDER",
+    "MEDIUM_MODEL",
+    "MEDIUM_PROVIDER",
+    "HIGH_MODEL",
+    "HIGH_PROVIDER",
+    "CLASSIFIER_TIMEOUT_S",
+)
+# Every generation a test may set, so `_clean_env` never leaks between tests.
+_ENV_KEYS = tuple(
+    f"{prefix}{suffix}"
+    for prefix in ("MODEL_PICKER_", "MODEL_CLASSIFIER_", "MODEL_ROUTER_")
+    for suffix in _SUFFIXES
 )
 
 
@@ -47,9 +51,10 @@ def _host_primary(model: str, provider: str):
 
 @contextmanager
 def _clean_env(**overlay: str):
-    old = {k: os.environ.get(k) for k in _ENV_KEYS}
+    keys = set(_ENV_KEYS) | set(overlay)
+    old = {k: os.environ.get(k) for k in keys}
     try:
-        for k in _ENV_KEYS:
+        for k in keys:
             os.environ.pop(k, None)
         os.environ.update(overlay)
         yield
@@ -62,8 +67,8 @@ def _clean_env(**overlay: str):
 
 
 def _load(name: str = "mr_settings", *, ids: bool = True):
-    if ids and not os.environ.get("MODEL_ROUTER_CONFIG"):
-        os.environ["MODEL_ROUTER_CONFIG"] = str(_OOBE_IDS)
+    if ids and not os.environ.get("MODEL_PICKER_CONFIG"):
+        os.environ["MODEL_PICKER_CONFIG"] = str(_OOBE_IDS)
     spec = importlib.util.spec_from_file_location(name, ROOT / "settings.py")
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -143,7 +148,7 @@ class Defaults(unittest.TestCase):
     def test_blank_ids_fall_back_to_the_host_primary_model(self) -> None:
         """No plugin config and no env: every tier uses the host's own model."""
         with tempfile.TemporaryDirectory() as tmp:
-            with _clean_env(MODEL_ROUTER_CONFIG=self._blank_cfg(tmp)), _host_primary(
+            with _clean_env(MODEL_PICKER_CONFIG=self._blank_cfg(tmp)), _host_primary(
                 "primary-model", "primary-provider"
             ):
                 mod = _load("mr_primary", ids=False)
@@ -155,25 +160,32 @@ class Defaults(unittest.TestCase):
     def test_blank_ids_with_no_host_model_are_inert_not_fatal(self) -> None:
         """Refusing to import would kill the plugin on a stock install."""
         with tempfile.TemporaryDirectory() as tmp:
-            with _clean_env(MODEL_ROUTER_CONFIG=self._blank_cfg(tmp)), _host_primary(
+            with _clean_env(MODEL_PICKER_CONFIG=self._blank_cfg(tmp)), _host_primary(
                 "", ""
             ):
                 mod = _load("mr_inert", ids=False)
         self.assertFalse(mod.CONFIGURED)
         self.assertEqual(set(mod.UNCONFIGURED_SLOTS), set(mod.NAMES))
 
-    def test_canonical_env_wins_over_legacy(self) -> None:
+    def test_canonical_env_wins_over_both_legacy_generations(self) -> None:
         with _clean_env(
-            MODEL_ROUTER_LOW_MODEL="legacy-low",
-            MODEL_CLASSIFIER_LOW_MODEL="canonical-low",
+            MODEL_ROUTER_LOW_MODEL="router-low",
+            MODEL_CLASSIFIER_LOW_MODEL="classifier-low",
+            MODEL_PICKER_LOW_MODEL="picker-low",
         ):
             mod = _load("mr_canon")
-        self.assertEqual(mod.MODELS["low"]["model"], "canonical-low")
+        self.assertEqual(mod.MODELS["low"]["model"], "picker-low")
 
-    def test_legacy_env_names_still_work(self) -> None:
-        with _clean_env(MODEL_ROUTER_HIGH_MODEL="legacy-high"):
-            mod = _load("mr_legacy")
-        self.assertEqual(mod.MODELS["high"]["model"], "legacy-high")
+    def test_both_legacy_env_generations_still_work(self) -> None:
+        with _clean_env(MODEL_ROUTER_HIGH_MODEL="router-high"):
+            self.assertEqual(
+                _load("mr_legacy_router").MODELS["high"]["model"], "router-high"
+            )
+        with _clean_env(MODEL_CLASSIFIER_HIGH_MODEL="classifier-high"):
+            self.assertEqual(
+                _load("mr_legacy_classifier").MODELS["high"]["model"],
+                "classifier-high",
+            )
 
     def test_declared_models_replace_catalog_ids(self) -> None:
         catalog = json.loads((ROOT / "config.default.json").read_text(encoding="utf-8"))
@@ -191,7 +203,7 @@ class Defaults(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with _clean_env(MODEL_ROUTER_CONFIG=str(cfg)):
+            with _clean_env(MODEL_PICKER_CONFIG=str(cfg)):
                 mod = _load("mr_declared_overlay")
         self.assertEqual(mod.MODELS["low"]["model"], "cheap")
         self.assertEqual(mod.MODELS["default"]["model"], "work")
@@ -221,7 +233,7 @@ class LegacyAlias(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with _clean_env(MODEL_ROUTER_CONFIG=str(cfg)):
+            with _clean_env(MODEL_PICKER_CONFIG=str(cfg)):
                 mod = _load("mr_legacy_models_key")
         self.assertEqual(list(mod.MODELS), ["low", "default", "high"])
         self.assertEqual(mod.MODELS["default"]["model"], "legacy-work")
@@ -230,14 +242,14 @@ class LegacyAlias(unittest.TestCase):
         self.assertIsNone(mod.as_name("ultra"))
 
     def test_medium_env_prefix_fills_default(self) -> None:
-        with _clean_env(MODEL_ROUTER_MEDIUM_MODEL="legacy-medium"):
+        with _clean_env(MODEL_PICKER_MEDIUM_MODEL="legacy-medium"):
             mod = _load("mr_legacy_env")
         self.assertEqual(mod.MODELS["default"]["model"], "legacy-medium")
 
     def test_default_env_prefix_wins_over_legacy(self) -> None:
         with _clean_env(
-            MODEL_ROUTER_MEDIUM_MODEL="legacy-medium",
-            MODEL_ROUTER_DEFAULT_MODEL="canonical",
+            MODEL_PICKER_MEDIUM_MODEL="legacy-medium",
+            MODEL_PICKER_DEFAULT_MODEL="canonical",
         ):
             mod = _load("mr_default_env_wins")
         self.assertEqual(mod.MODELS["default"]["model"], "canonical")
@@ -259,13 +271,13 @@ class EnvOverlay(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with _clean_env(MODEL_ROUTER_CONFIG=str(cfg)):
+            with _clean_env(MODEL_PICKER_CONFIG=str(cfg)):
                 mod = _load("mr_named_overlay")
             self.assertEqual(mod.MODELS["high"]["model"], "some-voice")
             self.assertEqual(mod.MODELS["high"]["provider"], "other")
 
     def test_low_model_env(self) -> None:
-        with _clean_env(MODEL_ROUTER_LOW_MODEL="flash-override"):
+        with _clean_env(MODEL_PICKER_LOW_MODEL="flash-override"):
             mod = _load("mr_low_env")
         self.assertEqual(mod.MODELS["low"]["model"], "flash-override")
 
@@ -287,7 +299,7 @@ class RejectFourth(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with _clean_env(MODEL_ROUTER_CONFIG=str(cfg)):
+            with _clean_env(MODEL_PICKER_CONFIG=str(cfg)):
                 with self.assertRaises(Exception) as ctx:
                     _load("mr_fourth")
             self.assertIn("ultra", str(ctx.exception))
@@ -317,7 +329,7 @@ class BestFor(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with _clean_env(MODEL_ROUTER_CONFIG=str(cfg)):
+            with _clean_env(MODEL_PICKER_CONFIG=str(cfg)):
                 mod = _load("mr_best_for_file")
         self.assertEqual(mod.MODELS["low"]["best_for"], ["Only pings"])
         self.assertIn("Only pings", mod.CLASSIFIER)
@@ -327,7 +339,7 @@ class BestFor(unittest.TestCase):
 
     def test_env_json_overlay(self) -> None:
         payload = json.dumps(["Status only"])
-        with _clean_env(MODEL_ROUTER_LOW_BEST_FOR=payload):
+        with _clean_env(MODEL_PICKER_LOW_BEST_FOR=payload):
             mod = _load("mr_best_for_env")
         self.assertEqual(mod.MODELS["low"]["best_for"], ["Status only"])
         self.assertIn("Status only", mod.CLASSIFIER)

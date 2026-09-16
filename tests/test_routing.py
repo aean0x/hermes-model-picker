@@ -40,7 +40,7 @@ def _host_engine(name: str):
 
 def _load():
     os.environ["MODEL_ROUTER_CONFIG"] = str(ROOT / "tests" / "oobe-ids.json")
-    spec = importlib.util.spec_from_file_location("model_classifier_routing", ROOT / "__init__.py")
+    spec = importlib.util.spec_from_file_location("model_picker_routing", ROOT / "__init__.py")
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -377,7 +377,7 @@ class HandoffEngine(unittest.TestCase):
         spec.loader.exec_module(cls.eng)
 
     def test_no_handoff_is_noop(self) -> None:
-        engine = self.eng.ModelClassifierContextEngine(model="grok-4.6")
+        engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
         req = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hello"},
@@ -386,21 +386,22 @@ class HandoffEngine(unittest.TestCase):
 
     def test_engine_name_is_canonical_by_default(self) -> None:
         with _host_engine(""):
-            self.assertEqual(self.eng.resolve_engine_name(), "model-classifier")
+            self.assertEqual(self.eng.resolve_engine_name(), "model-picker")
 
     def test_engine_name_honors_a_legacy_host_config(self) -> None:
         """Only one engine may register, so an un-edited config must still match."""
-        with _host_engine("model-router"):
-            self.assertEqual(self.eng.resolve_engine_name(), "model-router")
-            engine = self.eng.ModelClassifierContextEngine(model="grok-4.6")
-            self.assertEqual(engine.name, "model-router")
+        for legacy in ("model-classifier", "model-router"):
+            with _host_engine(legacy):
+                self.assertEqual(self.eng.resolve_engine_name(), legacy)
+                engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
+                self.assertEqual(engine.name, legacy)
 
     def test_engine_name_ignores_another_engines_name(self) -> None:
         with _host_engine("compressor"):
-            self.assertEqual(self.eng.resolve_engine_name(), "model-classifier")
+            self.assertEqual(self.eng.resolve_engine_name(), "model-picker")
 
     def test_handoff_replaces_request_and_keeps_system(self) -> None:
-        engine = self.eng.ModelClassifierContextEngine(model="grok-4.6")
+        engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
         engine.handoff = {
             "from_tier": "default",
             "to_tier": "high",
@@ -430,18 +431,18 @@ class HandoffEngine(unittest.TestCase):
         self.assertIsNone(engine.handoff)
 
     def test_handoff_is_one_shot(self) -> None:
-        engine = self.eng.ModelClassifierContextEngine(model="grok-4.6")
+        engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
         engine.handoff = {"summary": "s", "task_state": "t", "failure_point": "f"}
         req = [{"role": "system", "content": "sys"}]
         self.assertIsNotNone(engine.select_context(req))
         self.assertIsNone(engine.select_context(req))
 
     def test_force_compress_defaults_false(self) -> None:
-        engine = self.eng.ModelClassifierContextEngine(model="grok-4.6")
+        engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
         self.assertFalse(engine.force_compress_once)
 
     def test_force_compress_once_returns_true_then_delegates(self) -> None:
-        engine = self.eng.ModelClassifierContextEngine(model="grok-4.6")
+        engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
         engine.force_compress_once = True
         self.assertEqual(engine.should_compress_info(0), (True, None))
         self.assertFalse(engine.force_compress_once)

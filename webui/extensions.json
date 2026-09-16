@@ -1,10 +1,10 @@
 {
   "extensions": [
     {
-      "id": "model-classifier",
-      "name": "Model Classifier",
-      "scripts": ["config.js", "model-classifier.js"],
-      "stylesheets": ["model-classifier.css"]
+      "id": "model-picker",
+      "name": "Model Picker",
+      "scripts": ["config.js", "model-picker.js"],
+      "stylesheets": ["model-picker.css"]
     }
   ]
 }

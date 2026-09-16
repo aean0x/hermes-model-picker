@@ -1,4 +1,4 @@
-"""model-classifier — per-turn cost routing for Hermes across three named tiers.
+"""model-picker — per-turn cost routing for Hermes across three named tiers.
 
 Exactly three models: low < default < high. Models, providers, labels, and
 escalation are config — see settings.py and config.default.json. Override via
@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("plugins.model-classifier")
+logger = logging.getLogger("plugins.model-picker")
 
 
 def _import_settings() -> Any:
@@ -53,7 +53,7 @@ def _import_settings() -> Any:
         return settings_mod
     except ImportError:
         path = Path(__file__).resolve().parent / "settings.py"
-        spec = importlib.util.spec_from_file_location("_model_classifier_settings", path)
+        spec = importlib.util.spec_from_file_location("_model_picker_settings", path)
         if spec is None or spec.loader is None:
             raise
         mod = importlib.util.module_from_spec(spec)
@@ -97,7 +97,7 @@ def _attach_file_handler() -> None:
     hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
     log_dir = os.path.join(hermes_home, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    handler = logging.FileHandler(os.path.join(log_dir, "model-classifier.log"))
+    handler = logging.FileHandler(os.path.join(log_dir, "model-picker.log"))
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
@@ -242,7 +242,7 @@ def _same_route(agent: Any, model: str, provider: str) -> bool:
     base = _agent_base_url(agent)
     if not _base_url_matches_provider(base, provider):
         logger.warning(
-            "model-classifier: half-switch detected model=%s provider=%s base_url=%s — re-applying",
+            "model-picker: half-switch detected model=%s provider=%s base_url=%s — re-applying",
             getattr(agent, "model", ""),
             getattr(agent, "provider", ""),
             base,
@@ -328,7 +328,7 @@ def _repair_host_stomp(agent: Any) -> bool:
     if not want or _norm(want) == _norm(base):
         return False
     logger.warning(
-        "model-classifier: blocked host stomp model=%s provider=%s was=%s restore=%s",
+        "model-picker: blocked host stomp model=%s provider=%s was=%s restore=%s",
         getattr(agent, "model", ""),
         getattr(agent, "provider", ""),
         base,
@@ -415,7 +415,7 @@ def _wrap_cls_method(cls: Any, name: str, factory: Any) -> bool:
     orig = getattr(cls, name, None)
     if orig is None:
         return False
-    if getattr(orig, "_model_classifier_wrapped", False):
+    if getattr(orig, "_model_picker_wrapped", False):
         return True
     inner = factory(orig)
 
@@ -423,7 +423,7 @@ def _wrap_cls_method(cls: Any, name: str, factory: Any) -> bool:
     def wrapped(self, *args, **kwargs):
         return inner(self, *args, **_kwargs_accepted_by(orig, kwargs))
 
-    wrapped._model_classifier_wrapped = True  # type: ignore[attr-defined]
+    wrapped._model_picker_wrapped = True  # type: ignore[attr-defined]
     setattr(cls, name, wrapped)
     return True
 
@@ -433,7 +433,7 @@ def _install_agent_capture() -> None:
     try:
         import run_agent
     except Exception as exc:
-        logger.warning("model-classifier: cannot import run_agent for capture: %s", exc)
+        logger.warning("model-picker: cannot import run_agent for capture: %s", exc)
         return
 
     cls = run_agent.AIAgent
@@ -467,7 +467,7 @@ def _install_agent_capture() -> None:
             prov = getattr(self, "provider", "") or ""
             if not repaired and not _base_url_matches_provider(_agent_base_url(self), prov):
                 logger.warning(
-                    "model-classifier: skip client rebuild on unresolved host mismatch "
+                    "model-picker: skip client rebuild on unresolved host mismatch "
                     "model=%s provider=%s base_url=%s",
                     getattr(self, "model", ""),
                     prov,
@@ -487,11 +487,11 @@ def _install_agent_capture() -> None:
     _wrap_cls_method(cls, "switch_model", wrap_switch)
     if not _wrap_cls_method(cls, "_replace_primary_openai_client", wrap_replace):
         logger.info(
-            "model-classifier: AIAgent has no _replace_primary_openai_client; "
+            "model-picker: AIAgent has no _replace_primary_openai_client; "
             "host-stomp guard is pre_api_request only"
         )
     _patched = True
-    logger.info("model-classifier: AIAgent capture installed")
+    logger.info("model-picker: AIAgent capture installed")
 
 
 def _apply_tier(agent: Any, name: str) -> bool:
@@ -507,7 +507,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
         from hermes_cli.config import load_config
         from hermes_cli.model_switch import switch_model as resolve_switch
     except Exception as exc:
-        logger.warning("model-classifier: model_switch import failed: %s", exc)
+        logger.warning("model-picker: model_switch import failed: %s", exc)
         return False
 
     try:
@@ -531,12 +531,12 @@ def _apply_tier(agent: Any, name: str) -> bool:
             custom_providers=cfg.get("custom_providers"),
         )
     except Exception as exc:
-        logger.warning("model-classifier: resolve %s failed: %s", name, exc)
+        logger.warning("model-picker: resolve %s failed: %s", name, exc)
         return False
 
     if not getattr(result, "success", False):
         logger.warning(
-            "model-classifier: resolve %s failed: %s",
+            "model-picker: resolve %s failed: %s",
             name,
             getattr(result, "error_message", "unknown"),
         )
@@ -546,7 +546,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
     resolved_prov = getattr(result, "target_provider", None) or provider
     if not resolved_base:
         logger.warning(
-            "model-classifier: resolve %s returned empty base_url for %s/%s",
+            "model-picker: resolve %s returned empty base_url for %s/%s",
             name,
             resolved_prov,
             getattr(result, "new_model", model),
@@ -554,7 +554,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
         return False
     if not _base_url_matches_provider(resolved_base, resolved_prov):
         logger.warning(
-            "model-classifier: resolve %s host mismatch provider=%s base_url=%s",
+            "model-picker: resolve %s host mismatch provider=%s base_url=%s",
             name,
             resolved_prov,
             resolved_base,
@@ -570,7 +570,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
             result.api_mode or "",
         )
     except Exception as exc:
-        logger.warning("model-classifier: switch_model %s failed: %s", name, exc)
+        logger.warning("model-picker: switch_model %s failed: %s", name, exc)
         return False
 
     # Jurisdiction is model/provider only. Session reasoning stays
@@ -593,7 +593,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
         resolved_prov
     ):
         logger.warning(
-            "model-classifier: post-switch attrs mismatch want=%s/%s got=%s/%s",
+            "model-picker: post-switch attrs mismatch want=%s/%s got=%s/%s",
             resolved_prov,
             result.new_model,
             live_prov,
@@ -602,7 +602,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
         return False
     if not _base_url_matches_provider(live_base, resolved_prov):
         logger.warning(
-            "model-classifier: post-switch base_url still wrong for %s: provider=%s base_url=%s",
+            "model-picker: post-switch base_url still wrong for %s: provider=%s base_url=%s",
             name,
             resolved_prov,
             live_base,
@@ -610,7 +610,7 @@ def _apply_tier(agent: Any, name: str) -> bool:
         return False
 
     logger.info(
-        "model-classifier: applied %s → %s / %s (base=%s)",
+        "model-picker: applied %s → %s / %s (base=%s)",
         meta["label"],
         resolved_prov,
         result.new_model,
@@ -677,7 +677,7 @@ def _resolve_tier_runtime(name: str, agent: Any) -> dict[str, str] | None:
         from hermes_cli.config import load_config
         from hermes_cli.model_switch import switch_model as resolve_switch
     except Exception as exc:
-        logger.warning("model-classifier: model_switch import failed: %s", exc)
+        logger.warning("model-picker: model_switch import failed: %s", exc)
         return None
     try:
         cfg = load_config() or {}
@@ -711,7 +711,7 @@ def _resolve_tier_runtime(name: str, agent: Any) -> dict[str, str] | None:
             "api_mode": result.api_mode or "",
         }
     except Exception as exc:
-        logger.warning("model-classifier: resolve %s runtime failed: %s", name, exc)
+        logger.warning("model-picker: resolve %s runtime failed: %s", name, exc)
         return None
 
 
@@ -796,9 +796,9 @@ def _classify(user_message: str, history: list, session_id: str = "") -> str:
         named = as_name(raw)
         if named in allowed:
             return named
-        logger.warning("model-classifier: classifier non-name %r — default low", raw[:40])
+        logger.warning("model-picker: classifier non-name %r — default low", raw[:40])
     except Exception as exc:
-        logger.warning("model-classifier: classifier failed (%s) — default low", exc)
+        logger.warning("model-picker: classifier failed (%s) — default low", exc)
     return _MIN
 
 
@@ -826,7 +826,7 @@ def _target_tier(session_id: str, msg: str, history: list) -> tuple[str, str]:
         reason = "classify"
 
     logger.info(
-        "model-classifier: route %s (%s) words=%d sentences=%d preview=%r",
+        "model-picker: route %s (%s) words=%d sentences=%d preview=%r",
         name,
         reason,
         len(words),
@@ -845,11 +845,11 @@ def _set_tier(session_id: str, name: str, reason: str) -> None:
         prev = _last_tier.get(session_id)
         _last_tier[session_id] = name
     if prev != name:
-        logger.info("model-classifier: %s (%s) sid=%s", name, reason, session_id or "-")
+        logger.info("model-picker: %s (%s) sid=%s", name, reason, session_id or "-")
     agent = _get_agent(session_id)
     if agent is None:
         logger.warning(
-            "model-classifier: %s (%s) no live agent sid=%s",
+            "model-picker: %s (%s) no live agent sid=%s",
             name,
             reason,
             session_id or "-",
@@ -857,7 +857,7 @@ def _set_tier(session_id: str, name: str, reason: str) -> None:
         return
     if not _apply_tier(agent, name):
         logger.warning(
-            "model-classifier: %s apply failed sid=%s model=%s provider=%s base=%s",
+            "model-picker: %s apply failed sid=%s model=%s provider=%s base=%s",
             name,
             session_id or "-",
             getattr(agent, "model", "") or "-",
@@ -883,7 +883,7 @@ def _request_compaction(agent: Any) -> None:
     try:
         engine.force_compress_once = True
     except Exception as exc:
-        logger.warning("model-classifier: force-compact flag failed: %s", exc)
+        logger.warning("model-picker: force-compact flag failed: %s", exc)
 
 
 def _should_skip(platform: str, kwargs: dict) -> bool:
@@ -964,7 +964,7 @@ def on_pre_llm_call(
         _set_tier(sid, name, reason)
         return None
     except Exception as exc:
-        logger.warning("model-classifier: on_pre_llm_call error: %s", exc, exc_info=True)
+        logger.warning("model-picker: on_pre_llm_call error: %s", exc, exc_info=True)
         return None
 
 
@@ -988,7 +988,7 @@ def on_pre_api_request(*, session_id: str = "", platform: str = "", **kwargs: An
         else:
             _heal_uncategorized(agent)
     except Exception as exc:
-        logger.warning("model-classifier: on_pre_api_request error: %s", exc, exc_info=True)
+        logger.warning("model-picker: on_pre_api_request error: %s", exc, exc_info=True)
 
 
 def _heal_uncategorized(agent: Any) -> None:
@@ -1005,7 +1005,7 @@ def _heal_uncategorized(agent: Any) -> None:
             heal = n
             break
     logger.warning(
-        "model-classifier: uncategorized half-switch heal→%s model=%s base=%s",
+        "model-picker: uncategorized half-switch heal→%s model=%s base=%s",
         heal,
         m,
         base,
@@ -1069,13 +1069,13 @@ def on_post_tool_call(
                 _checkpoint[sid] = True
                 _tool_errors[sid] = 0
             logger.info(
-                "model-classifier: escalation checkpoint staged sid=%s after %d tool errors (tier=%s)",
+                "model-picker: escalation checkpoint staged sid=%s after %d tool errors (tier=%s)",
                 sid,
                 count,
                 current,
             )
     except Exception as exc:
-        logger.warning("model-classifier: on_post_tool_call error: %s", exc, exc_info=True)
+        logger.warning("model-picker: on_post_tool_call error: %s", exc, exc_info=True)
 
 
 def _resolve_cmd_sid() -> str:
@@ -1106,7 +1106,7 @@ def _cmd_pin(raw_args: str, name: str) -> str:
     meta = MODELS[name]
     with _lock:
         _pinned[sid] = True
-    logger.info("model-classifier: /%s pin sid=%s", name, sid or "-")
+    logger.info("model-picker: /%s pin sid=%s", name, sid or "-")
     _set_tier(sid, name, "pin")
     if agent is not None:
         return (
@@ -1129,7 +1129,7 @@ def _cmd_auto(raw_args: str) -> str:
         _last_msg.pop(sid, None)
         _last_tier.pop(sid, None)
         _tool_errors.pop(sid, None)
-    logger.info("model-classifier: /auto sid=%s was_pinned=%s", sid or "-", was)
+    logger.info("model-picker: /auto sid=%s was_pinned=%s", sid or "-", was)
     if was:
         return "Auto routing resumed. Next turn is classified automatically."
     return "Auto routing already active."
@@ -1140,15 +1140,15 @@ def _deferred_install_capture() -> None:
     for i in range(10):
         try:
             _install_agent_capture()
-            logger.info("model-classifier: AIAgent capture installed (attempt %d)", i + 1)
+            logger.info("model-picker: AIAgent capture installed (attempt %d)", i + 1)
             return
         except AttributeError:  # run_agent still initializing
             time.sleep(1.0)
         except Exception as exc:
-            logger.warning("model-classifier: AIAgent capture install failed: %s", exc)
+            logger.warning("model-picker: AIAgent capture install failed: %s", exc)
             return
     logger.warning(
-        "model-classifier: AIAgent capture NOT installed after retries (run_agent never ready)"
+        "model-picker: AIAgent capture NOT installed after retries (run_agent never ready)"
     )
 
 
@@ -1220,10 +1220,10 @@ def _handle_escalate_model(**kwargs: Any) -> str:
             try:
                 engine.handoff = handoff
             except Exception as exc:
-                logger.warning("model-classifier: handoff stash failed: %s", exc)
+                logger.warning("model-picker: handoff stash failed: %s", exc)
         else:
             logger.warning(
-                "model-classifier: no handoff engine on agent — escalation falls back to "
+                "model-picker: no handoff engine on agent — escalation falls back to "
                 "per-model compaction thresholds only"
             )
 
@@ -1238,7 +1238,7 @@ def _handle_escalate_model(**kwargs: Any) -> str:
             "re-reading the full conversation."
         )
     except Exception as exc:
-        logger.warning("model-classifier: escalate_model failed: %s", exc, exc_info=True)
+        logger.warning("model-picker: escalate_model failed: %s", exc, exc_info=True)
         return f"escalate_model failed: {exc}"
 
 
@@ -1279,7 +1279,7 @@ def _register_escalate_tool(ctx: Any) -> None:
 
 def _register_engine(ctx: Any) -> None:
     if not hasattr(ctx, "register_context_engine"):
-        logger.warning("model-classifier: ctx has no register_context_engine; handoff disabled")
+        logger.warning("model-picker: ctx has no register_context_engine; handoff disabled")
         return
     try:
         try:
@@ -1289,16 +1289,16 @@ def _register_engine(ctx: Any) -> None:
             from pathlib import Path
 
             path = Path(__file__).with_name("engine.py")
-            spec = importlib.util.spec_from_file_location("model_classifier_engine", path)
+            spec = importlib.util.spec_from_file_location("model_picker_engine", path)
             if spec is None or spec.loader is None:
                 raise ImportError(f"cannot load {path}")
             _engine = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(_engine)
-        inst = _engine.ModelClassifierContextEngine(model="")
+        inst = _engine.ModelPickerContextEngine(model="")
         ctx.register_context_engine(inst)
-        logger.info("model-classifier: handoff context engine registered (name=%s)", inst.name)
+        logger.info("model-picker: handoff context engine registered (name=%s)", inst.name)
     except Exception as exc:
-        logger.warning("model-classifier: handoff engine registration failed: %s", exc)
+        logger.warning("model-picker: handoff engine registration failed: %s", exc)
 
 
 def register(ctx: Any) -> None:
@@ -1319,18 +1319,18 @@ def register(ctx: Any) -> None:
             lambda args, n=name: _cmd_pin(args, n),
             f"Pin session to {label} ({meta.get('provider')}/{meta.get('model')})",
         )
-    ctx.register_command("auto", _cmd_auto, "Resume model-classifier auto routing")
+    ctx.register_command("auto", _cmd_auto, "Resume model-picker auto routing")
     if not _CONFIGURED:
         logger.warning(
-            "model-classifier: no model id for %s, and the Hermes config names no "
+            "model-picker: no model id for %s, and the Hermes config names no "
             "primary model either; plugin is registered but inert. Set "
-            "MODEL_CLASSIFIER_*_MODEL, config.json, or hermesPnP.models.",
+            "MODEL_PICKER_*_MODEL, config.json, or hermesPnP.models.",
             ", ".join(_UNCONFIGURED_SLOTS) or "any tier",
         )
         return
     labels = " / ".join(f"{n} {MODELS[n].get('label')}" for n in NAMES)
     logger.info(
-        "model-classifier: %s | escalate≤%s | /low /default /high /auto | no SOUL writes",
+        "model-picker: %s | escalate≤%s | /low /default /high /auto | no SOUL writes",
         labels,
         _ESCALATE_MAX,
     )

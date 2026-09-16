@@ -7,7 +7,10 @@
     { cmd: "/default", label: "Standard", short: "Standard", model: "", title: "Pin Standard" },
     { cmd: "/high", label: "Expert", short: "Expert", model: "", title: "Pin Expert" },
   ];
-  const cfg = window.__MODEL_CLASSIFIER_CONFIG || window.__MODEL_ROUTER_CONFIG;
+  const cfg =
+    window.__MODEL_PICKER_CONFIG ||
+    window.__MODEL_CLASSIFIER_CONFIG ||
+    window.__MODEL_ROUTER_CONFIG;
   const fromCfg = (cfg && cfg.models) || [];
   const listed = Array.isArray(fromCfg) ? fromCfg.filter((row) => row && row.cmd !== "/auto") : [];
   const MODELS = listed.length ? listed : DEFAULT_MODELS;
@@ -65,12 +68,12 @@
     const model = sessionModel();
     const row = matchModel(model);
     if (!isPinned()) {
-      if (isBusy() && row) return `Model Classifier auto-routing (${row.label}): ${model}`;
-      return "Model Classifier auto-routing";
+      if (isBusy() && row) return `Model Picker auto-routing (${row.label}): ${model}`;
+      return "Model Picker auto-routing";
     }
     const pinned = MODELS.find((m) => m.cmd === lastCmd) || row;
-    if (!pinned) return "Model Classifier pinned";
-    return `Model Classifier pinned: ${pinned.label}${model ? " → " + model : ""}`;
+    if (!pinned) return "Model Picker pinned";
+    return `Model Picker pinned: ${pinned.label}${model ? " → " + model : ""}`;
   }
 
   function overlayChip() {
@@ -114,14 +117,14 @@
         await window.send();
       } catch (err) {
         if (typeof window.showToast === "function") {
-          window.showToast(`Model Classifier: ${err.message || err}`, 3200);
+          window.showToast(`Model Picker: ${err.message || err}`, 3200);
         }
       }
       overlayChip();
       return;
     }
     if (typeof window.showToast === "function") {
-      window.showToast("Model Classifier: composer send() not available", 2800);
+      window.showToast("Model Picker: composer send() not available", 2800);
     }
   }
 
@@ -144,7 +147,7 @@
     if (!host || host.querySelector(".mr-bar")) return;
     const bar = document.createElement("div");
     bar.className = "mr-bar";
-    bar.id = "model-classifier-bar";
+    bar.id = "model-picker-bar";
     const label = document.createElement("span");
     label.className = "mr-label";
     label.textContent = "Router";
