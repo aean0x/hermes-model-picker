@@ -1294,9 +1294,9 @@ def _register_engine(ctx: Any) -> None:
                 raise ImportError(f"cannot load {path}")
             _engine = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(_engine)
-        inst = _engine.ModelRouterContextEngine(model="")
+        inst = _engine.ModelClassifierContextEngine(model="")
         ctx.register_context_engine(inst)
-        logger.info("model-classifier: handoff context engine registered (name=%s)", _engine.ENGINE_NAME)
+        logger.info("model-classifier: handoff context engine registered (name=%s)", inst.name)
     except Exception as exc:
         logger.warning("model-classifier: handoff engine registration failed: %s", exc)
 
