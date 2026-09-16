@@ -1,0 +1,10 @@
+{
+  "extensions": [
+    {
+      "id": "model-classifier",
+      "name": "Model Classifier",
+      "scripts": ["config.js", "model-classifier.js"],
+      "stylesheets": ["model-classifier.css"]
+    }
+  ]
+}
