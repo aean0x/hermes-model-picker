@@ -10,8 +10,6 @@ description: >-
   is the deprecated alias for `/default`. Model id and provider come from
   config.json (Nix hermesPnP.models), a MODEL_PICKER_CONFIG path, or
   MODEL_PICKER_* env; with none of those, all three tiers default to the
-  host's own primary model. The earlier env generations MODEL_CLASSIFIER_*
-  and MODEL_ROUTER_* remain accepted as legacy aliases. Uses
   AIAgent.switch_model — no Hermes/WebUI core edits.
   Blocks credential-refresh host stomps.
 author: aean0x

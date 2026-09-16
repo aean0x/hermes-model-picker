@@ -2,7 +2,7 @@
 
 This module does not own model IDs. Slot names are low/default/high.
 "medium" is the deprecated alias for "default" (the v0.8 lexicon) and is
-still accepted in config keys, MODEL_CLASSIFIER_MEDIUM_* env, and
+still accepted in config keys and
 pin/classifier tokens. Labels and `best_for` default from
 config.default.json. Model id and provider come from, in order:
 config.default.json, config.json (Nix `hermesPnP.models`), a
@@ -10,10 +10,7 @@ MODEL_PICKER_CONFIG path, MODEL_PICKER_* env — and, if none of those
 name a model, the host's own primary model (`model.default` in the Hermes
 config) for all three tiers. No Hermes/WebUI core files are edited.
 
-Env names are canonical `MODEL_PICKER_*`. Both earlier generations still work
-as legacy aliases — `MODEL_CLASSIFIER_*` (the 0.10 name) and `MODEL_ROUTER_*`
-(the original) — so an existing deployment keeps its configuration; the
-canonical name wins when more than one is set.
+Env names are canonical `MODEL_PICKER_*`; no earlier generation is read.
 
 The `best_for` list on each tier is the source of truth for the
 classifier prompt. A short steer block (prefer-low on doubt; high is
@@ -41,19 +38,9 @@ LEGACY_NAMES: dict[str, str] = {"medium": "default"}
 _ALIASES: dict[str, str] = {**LEGACY_NAMES, **{n: n for n in NAMES}}
 
 # Per-slot env prefixes, lowest precedence first: the deprecated
-# MODEL_ROUTER_MEDIUM_* group, then the pre-rename MODEL_ROUTER_* names, then
-# the canonical MODEL_CLASSIFIER_* names. A later entry overwrites an earlier
 # one, so canonical wins over legacy and an explicit DEFAULT_* wins over the
 # deprecated MEDIUM_* alias.
 _ENV_SLOTS: tuple[tuple[str, str], ...] = (
-    ("low", "MODEL_ROUTER_LOW_"),
-    ("default", "MODEL_ROUTER_MEDIUM_"),
-    ("default", "MODEL_ROUTER_DEFAULT_"),
-    ("high", "MODEL_ROUTER_HIGH_"),
-    ("low", "MODEL_CLASSIFIER_LOW_"),
-    ("default", "MODEL_CLASSIFIER_MEDIUM_"),
-    ("default", "MODEL_CLASSIFIER_DEFAULT_"),
-    ("high", "MODEL_CLASSIFIER_HIGH_"),
     ("low", "MODEL_PICKER_LOW_"),
     ("default", "MODEL_PICKER_MEDIUM_"),
     ("default", "MODEL_PICKER_DEFAULT_"),
@@ -61,13 +48,10 @@ _ENV_SLOTS: tuple[tuple[str, str], ...] = (
 )
 
 # Knobs read outside the per-slot loop: canonical name first, then the two
-# legacy generations (model-classifier, then the original model-router).
 _ENV_ALIASES: dict[str, tuple[str, ...]] = {
-    "CONFIG": ("MODEL_PICKER_CONFIG", "MODEL_CLASSIFIER_CONFIG", "MODEL_ROUTER_CONFIG"),
+    "CONFIG": ("MODEL_PICKER_CONFIG",),
     "CLASSIFIER_TIMEOUT_S": (
         "MODEL_PICKER_CLASSIFIER_TIMEOUT_S",
-        "MODEL_CLASSIFIER_CLASSIFIER_TIMEOUT_S",
-        "MODEL_ROUTER_CLASSIFIER_TIMEOUT_S",
     ),
 }
 
@@ -78,8 +62,6 @@ def env_knob(name: str) -> str | None:
         name,
         (
             f"MODEL_PICKER_{name}",
-            f"MODEL_CLASSIFIER_{name}",
-            f"MODEL_ROUTER_{name}",
         ),
     ):
         raw = os.environ.get(key)

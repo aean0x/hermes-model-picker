@@ -82,13 +82,10 @@ classify) rather than failing to load if the host has no primary model either.
 ### Environment
 
 Canonical names are `MODEL_PICKER_*`. Both earlier generations are still
-accepted as legacy aliases — `MODEL_CLASSIFIER_*` (the 0.10 name) and
-`MODEL_ROUTER_*` (the original) — so an existing deployment keeps its
 configuration; the canonical name wins when more than one is set.
 
 | Variable | Meaning |
 | --- | --- |
-| `MODEL_PICKER_CONFIG` | Path to a config.json (legacy: `MODEL_CLASSIFIER_CONFIG`, `MODEL_ROUTER_CONFIG`). |
 | `MODEL_PICKER_LOW_MODEL` / `_PROVIDER` / `_LABEL` / `_BEST_FOR` | Per-slot override for `low`. |
 | `MODEL_PICKER_DEFAULT_MODEL` / `_PROVIDER` / `_LABEL` / `_BEST_FOR` | Per-slot override for `default`. |
 | `MODEL_PICKER_HIGH_MODEL` / `_PROVIDER` / `_LABEL` / `_BEST_FOR` | Per-slot override for `high`. |
@@ -97,7 +94,6 @@ configuration; the canonical name wins when more than one is set.
 `MODEL_PICKER_MEDIUM_*` is the deprecated alias for the `default` slot.
 
 `context.engine` likewise follows the host config: the handoff engine
-advertises `model-picker`, or `model-classifier` / `model-router` if an older
 `config.yaml` still selects one of those names.
 
 ## Behaviour worth knowing

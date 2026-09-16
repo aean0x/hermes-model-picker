@@ -39,7 +39,7 @@ def _host_engine(name: str):
 
 
 def _load():
-    os.environ["MODEL_ROUTER_CONFIG"] = str(ROOT / "tests" / "oobe-ids.json")
+    os.environ["MODEL_PICKER_CONFIG"] = str(ROOT / "tests" / "oobe-ids.json")
     spec = importlib.util.spec_from_file_location("model_picker_routing", ROOT / "__init__.py")
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -383,22 +383,6 @@ class HandoffEngine(unittest.TestCase):
             {"role": "user", "content": "hello"},
         ]
         self.assertIsNone(engine.select_context(req))
-
-    def test_engine_name_is_canonical_by_default(self) -> None:
-        with _host_engine(""):
-            self.assertEqual(self.eng.resolve_engine_name(), "model-picker")
-
-    def test_engine_name_honors_a_legacy_host_config(self) -> None:
-        """Only one engine may register, so an un-edited config must still match."""
-        for legacy in ("model-classifier", "model-router"):
-            with _host_engine(legacy):
-                self.assertEqual(self.eng.resolve_engine_name(), legacy)
-                engine = self.eng.ModelPickerContextEngine(model="grok-4.6")
-                self.assertEqual(engine.name, legacy)
-
-    def test_engine_name_ignores_another_engines_name(self) -> None:
-        with _host_engine("compressor"):
-            self.assertEqual(self.eng.resolve_engine_name(), "model-picker")
 
     def test_handoff_replaces_request_and_keeps_system(self) -> None:
         engine = self.eng.ModelPickerContextEngine(model="grok-4.6")

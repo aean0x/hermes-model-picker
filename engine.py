@@ -28,37 +28,6 @@ from typing import Any
 from agent.context_compressor import ContextCompressor
 
 ENGINE_NAME = "model-picker"
-# Earlier generations of this engine's name. `context.engine` in the Hermes
-# config selects the engine by name, and only one context engine may be
-# registered — so a deployment whose config still says "model-classifier" or
-# "model-router" must keep working. The instance advertises whichever known
-# name the host config asks for.
-LEGACY_ENGINE_NAMES = ("model-classifier", "model-router")
-
-
-def resolve_engine_name() -> str:
-    """Name to advertise: the one the host config selects, if it is ours.
-
-    Falls back to the canonical name when the config names nothing or names a
-    different engine. This keeps an un-edited config.yaml working across the
-    renames without silently dropping the handoff engine.
-    """
-    try:
-        from hermes_cli.config import read_raw_config
-
-        cfg = read_raw_config() or {}
-    except Exception:
-        return ENGINE_NAME
-    context = cfg.get("context") if isinstance(cfg, dict) else None
-    wanted = ""
-    if isinstance(context, dict):
-        wanted = str(context.get("engine") or "").strip()
-    elif isinstance(context, str):
-        wanted = context.strip()
-    known = (ENGINE_NAME, *LEGACY_ENGINE_NAMES)
-    return wanted if wanted in known else ENGINE_NAME
-
-
 # Fallback tail budget if the settings module cannot be loaded (roughly 16k
 # tokens at ~4 chars/token). The handoff summary (2-8k tokens) plus this tail
 # lands the total within the 20-30k escalation budget.
@@ -114,7 +83,7 @@ class ModelPickerContextEngine(ContextCompressor):
         self, *args: Any, model: str = "", name: str | None = None, **kwargs: Any
     ) -> None:
         super().__init__(*args, model=model, **kwargs)
-        self._name = name or resolve_engine_name()
+        self._name = name or ENGINE_NAME
         self.handoff: dict[str, Any] | None = None
         self._handoff_tail_chars: int = _load_tail_chars()
         # One-shot: set by the router on a classifier-driven tier change to

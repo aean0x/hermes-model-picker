@@ -7,10 +7,7 @@
     { cmd: "/default", label: "Standard", short: "Standard", model: "", title: "Pin Standard" },
     { cmd: "/high", label: "Expert", short: "Expert", model: "", title: "Pin Expert" },
   ];
-  const cfg =
-    window.__MODEL_PICKER_CONFIG ||
-    window.__MODEL_CLASSIFIER_CONFIG ||
-    window.__MODEL_ROUTER_CONFIG;
+  const cfg = window.__MODEL_PICKER_CONFIG;
   const fromCfg = (cfg && cfg.models) || [];
   const listed = Array.isArray(fromCfg) ? fromCfg.filter((row) => row && row.cmd !== "/auto") : [];
   const MODELS = listed.length ? listed : DEFAULT_MODELS;

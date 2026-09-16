@@ -2,7 +2,7 @@
 
 Exactly three models: low < default < high. Models, providers, labels, and
 escalation are config — see settings.py and config.default.json. Override via
-a plugin-adjacent config.json, a MODEL_ROUTER_CONFIG path, or MODEL_ROUTER_*
+a plugin-adjacent config.json, a MODEL_PICKER_CONFIG path, or MODEL_PICKER_*
 env vars. "medium" is the deprecated alias for "default" and still pins the
 default slot.
 

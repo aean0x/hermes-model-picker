@@ -33,7 +33,7 @@ _SUFFIXES = (
 # Every generation a test may set, so `_clean_env` never leaks between tests.
 _ENV_KEYS = tuple(
     f"{prefix}{suffix}"
-    for prefix in ("MODEL_PICKER_", "MODEL_CLASSIFIER_", "MODEL_ROUTER_")
+    for prefix in ("MODEL_PICKER_",)
     for suffix in _SUFFIXES
 )
 
@@ -166,26 +166,6 @@ class Defaults(unittest.TestCase):
                 mod = _load("mr_inert", ids=False)
         self.assertFalse(mod.CONFIGURED)
         self.assertEqual(set(mod.UNCONFIGURED_SLOTS), set(mod.NAMES))
-
-    def test_canonical_env_wins_over_both_legacy_generations(self) -> None:
-        with _clean_env(
-            MODEL_ROUTER_LOW_MODEL="router-low",
-            MODEL_CLASSIFIER_LOW_MODEL="classifier-low",
-            MODEL_PICKER_LOW_MODEL="picker-low",
-        ):
-            mod = _load("mr_canon")
-        self.assertEqual(mod.MODELS["low"]["model"], "picker-low")
-
-    def test_both_legacy_env_generations_still_work(self) -> None:
-        with _clean_env(MODEL_ROUTER_HIGH_MODEL="router-high"):
-            self.assertEqual(
-                _load("mr_legacy_router").MODELS["high"]["model"], "router-high"
-            )
-        with _clean_env(MODEL_CLASSIFIER_HIGH_MODEL="classifier-high"):
-            self.assertEqual(
-                _load("mr_legacy_classifier").MODELS["high"]["model"],
-                "classifier-high",
-            )
 
     def test_declared_models_replace_catalog_ids(self) -> None:
         catalog = json.loads((ROOT / "config.default.json").read_text(encoding="utf-8"))
