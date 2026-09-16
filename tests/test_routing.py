@@ -29,6 +29,16 @@ def _hermes_src() -> Path:
 HERMES_SRC = _hermes_src()
 
 
+# engine.py imports agent.context_compressor, which exists only inside a Hermes
+# install. Tests that drive the engine skip when Hermes is not importable.
+try:
+    import agent.context_compressor  # noqa: F401
+
+    _HERMES_IMPORTABLE = True
+except Exception:
+    _HERMES_IMPORTABLE = False
+
+
 def _host_engine(name: str):
     """Stub the host config's context.engine value."""
     pkg = types.ModuleType("hermes_cli")
@@ -220,6 +230,7 @@ class Escalate(unittest.TestCase):
         self.assertEqual(reason, "classify")
 
 
+@unittest.skipUnless(_HERMES_IMPORTABLE, "needs a Hermes install")
 class ClassifierSignal(unittest.TestCase):
     """The classifier sees the previous tier and is biased to keep it."""
 
