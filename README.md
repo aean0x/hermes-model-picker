@@ -81,11 +81,11 @@ classify) rather than failing to load if the host has no primary model either.
 
 ### Environment
 
-Canonical names are `MODEL_PICKER_*`. Both earlier generations are still
-configuration; the canonical name wins when more than one is set.
+Canonical names are `MODEL_PICKER_*`; no earlier generation is read.
 
 | Variable | Meaning |
 | --- | --- |
+| `MODEL_PICKER_CONFIG` | Path to a config.json (overrides the plugin-adjacent one). |
 | `MODEL_PICKER_LOW_MODEL` / `_PROVIDER` / `_LABEL` / `_BEST_FOR` | Per-slot override for `low`. |
 | `MODEL_PICKER_DEFAULT_MODEL` / `_PROVIDER` / `_LABEL` / `_BEST_FOR` | Per-slot override for `default`. |
 | `MODEL_PICKER_HIGH_MODEL` / `_PROVIDER` / `_LABEL` / `_BEST_FOR` | Per-slot override for `high`. |
