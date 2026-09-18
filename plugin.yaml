@@ -1,5 +1,5 @@
 name: model-picker
-version: 0.11.0
+version: 0.11.1
 description: >-
   Per-turn cost classifier across three named tiers (low / default / high),
   labelled Quick / Standard / Expert. Classifies each user turn from best_for
@@ -9,9 +9,9 @@ description: >-
   failures via escalate_model. Pins with /low /default /high /auto; `/medium`
   is the deprecated alias for `/default`. Model id and provider come from
   config.json (Nix hermesPnP.models), a MODEL_PICKER_CONFIG path, or
-  MODEL_PICKER_* env; with none of those, all three tiers default to the
-  AIAgent.switch_model — no Hermes/WebUI core edits.
-  Blocks credential-refresh host stomps.
+  MODEL_PICKER_* env; with none of those, all three tiers default to the model the
+  Hermes config names as primary — no Hermes/WebUI core edits.
+  Also blocks credential-refresh host stomps.
 author: aean0x
 kind: standalone
 provides_hooks:
