@@ -160,10 +160,8 @@ class Escalate(unittest.TestCase):
             self.mod._last_tier["sid"] = "default"
             self.mod._last_user_sid = "sid"
         out = self.mod._handle_escalate_model(
+            {"summary": "s", "task_state": "t", "failure_point": "f"},
             session_id="sid",
-            summary="s",
-            task_state="t",
-            failure_point="f",
         )
         self.assertIn("Pinned", out)
         with self.mod._lock:
@@ -173,10 +171,8 @@ class Escalate(unittest.TestCase):
         with self.mod._lock:
             self.mod._last_tier["sid"] = "high"
         out = self.mod._handle_escalate_model(
+            {"summary": "s", "task_state": "t", "failure_point": "f"},
             session_id="sid",
-            summary="s",
-            task_state="t",
-            failure_point="f",
         )
         self.assertIn("highest tier", out)
 
@@ -189,13 +185,16 @@ class Escalate(unittest.TestCase):
             patch.object(self.mod, "_get_agent", return_value=agent),
             patch.object(self.mod, "_set_tier") as set_tier,
         ):
+            # Hermes dispatch shape: handler(args, **context) (tools/registry.py).
             out = self.mod._handle_escalate_model(
+                {
+                    "summary": "we decided X",
+                    "task_state": "trying Y",
+                    "tried_so_far": "Z failed",
+                    "failure_point": "exact error: boom",
+                    "next_hypothesis": "try W",
+                },
                 session_id="sid",
-                summary="we decided X",
-                task_state="trying Y",
-                tried_so_far="Z failed",
-                failure_point="exact error: boom",
-                next_hypothesis="try W",
             )
         self.assertIn("Escalated", out)
         set_tier.assert_called_once_with("sid", "high", "escalate_model")
@@ -204,6 +203,28 @@ class Escalate(unittest.TestCase):
         self.assertEqual(engine.handoff["from_tier"], "default")
         self.assertEqual(engine.handoff["to_tier"], "high")
         self.assertEqual(engine.handoff["to_model"], self.mod.MODELS["high"]["model"])
+
+    def test_escalate_schema_is_hermes_tool_shape(self) -> None:
+        # Hermes emits {"type": "function", "function": {**schema, "name": ...}},
+        # so the argument JSON Schema must live under "parameters".
+        schema = self.mod.ESCALATE_SCHEMA
+        self.assertEqual(schema["name"], "escalate_model")
+        self.assertEqual(schema["parameters"]["type"], "object")
+        self.assertIn("failure_point", schema["parameters"]["properties"])
+        self.assertNotIn("properties", schema)
+
+    def test_user_turn_anchors_command_session(self) -> None:
+        # /low, /high, /auto resolve via _resolve_cmd_sid; the anchor must be
+        # the session that sent the last real user turn, not _last_bound.
+        with (
+            patch.object(self.mod, "_get_agent", return_value=None),
+            patch.object(self.mod, "_target_tier", return_value=("low", "classify")),
+            patch.object(self.mod, "_set_tier"),
+            patch.object(self.mod, "_last_bound", ("other-session", None)),
+        ):
+            self.mod.on_pre_llm_call(user_message="hello", session_id="alice")
+            self.assertEqual(self.mod._last_user_sid, "alice")
+            self.assertEqual(self.mod._resolve_cmd_sid(), "alice")
 
     def test_auto_after_high_pin_bumps_down(self) -> None:
         # Live 0.5.0 bug: /auto after /high left the router on grok because the

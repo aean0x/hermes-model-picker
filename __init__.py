@@ -906,6 +906,7 @@ def on_pre_llm_call(
     platform: str = "",
     **kwargs: Any,
 ) -> dict | None:
+    global _last_user_sid
     try:
         if not _CONFIGURED:
             return None
@@ -1153,40 +1154,48 @@ def _deferred_install_capture() -> None:
 
 
 ESCALATE_SCHEMA: dict[str, Any] = {
-    "type": "object",
+    "name": "escalate_model",
     "description": (
         "Escalate to the next-higher model when the current model is stuck. "
         "Provide a structured handoff so the stronger model can continue without "
         "re-reading the full conversation."
     ),
-    "properties": {
-        "summary": {
-            "type": "string",
-            "description": "Concise summary of what has been established/decided so far.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Concise summary of what has been established/decided so far.",
+            },
+            "task_state": {
+                "type": "string",
+                "description": "What this turn is trying to accomplish, in detail.",
+            },
+            "tried_so_far": {
+                "type": "string",
+                "description": "What approaches were already attempted.",
+            },
+            "failure_point": {
+                "type": "string",
+                "description": "Where it is stuck, including the exact error text if any.",
+            },
+            "next_hypothesis": {
+                "type": "string",
+                "description": "Best next approach to try on the stronger model (optional).",
+            },
         },
-        "task_state": {
-            "type": "string",
-            "description": "What this turn is trying to accomplish, in detail.",
-        },
-        "tried_so_far": {
-            "type": "string",
-            "description": "What approaches were already attempted.",
-        },
-        "failure_point": {
-            "type": "string",
-            "description": "Where it is stuck, including the exact error text if any.",
-        },
-        "next_hypothesis": {
-            "type": "string",
-            "description": "Best next approach to try on the stronger model (optional).",
-        },
+        "required": ["summary", "task_state", "failure_point"],
     },
-    "required": ["summary", "task_state", "failure_point"],
 }
 
 
-def _handle_escalate_model(**kwargs: Any) -> str:
-    """Switch to the next tier and stash a structured handoff for the context engine."""
+def _handle_escalate_model(args: dict | None = None, **kwargs: Any) -> str:
+    """Switch to the next tier and stash a structured handoff for the context engine.
+
+    Hermes dispatches tools as ``handler(args, **context)``: the model's
+    arguments arrive in ``args``; ``session_id``/``task_id`` arrive as kwargs.
+    """
+    args = args if isinstance(args, dict) else {}
     try:
         sid = str(kwargs.get("session_id") or kwargs.get("task_id") or "").strip()
         if not sid:
@@ -1206,11 +1215,11 @@ def _handle_escalate_model(**kwargs: Any) -> str:
             "from_tier": current,
             "to_tier": target,
             "to_model": dest.get("model") or target,
-            "summary": str(kwargs.get("summary") or "").strip(),
-            "task_state": str(kwargs.get("task_state") or "").strip(),
-            "tried_so_far": str(kwargs.get("tried_so_far") or "").strip(),
-            "failure_point": str(kwargs.get("failure_point") or "").strip(),
-            "next_hypothesis": str(kwargs.get("next_hypothesis") or "").strip(),
+            "summary": str(args.get("summary") or "").strip(),
+            "task_state": str(args.get("task_state") or "").strip(),
+            "tried_so_far": str(args.get("tried_so_far") or "").strip(),
+            "failure_point": str(args.get("failure_point") or "").strip(),
+            "next_hypothesis": str(args.get("next_hypothesis") or "").strip(),
         }
 
         # Stash the handoff on the context engine so select_context swaps the
