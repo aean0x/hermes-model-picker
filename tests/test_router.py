@@ -1,14 +1,56 @@
-"""Router pin / name helpers (no Hermes)."""
+"""Router pin/name helpers, the llm_request middleware, and the registered surface.
+
+No Hermes install is needed for these: the middleware and the registration shape
+are pure plugin code. The engine-registration cases skip when Hermes is absent.
+"""
 
 from __future__ import annotations
 
 import importlib.util
 import os
+import sys
+import types
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from unittest.mock import patch
+
+try:  # loaded as ``tests.test_router`` under discovery
+    from .support import install_engine_stub
+except ImportError:  # loaded as a top-level module
+    from support import install_engine_stub  # type: ignore
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _hermes_src() -> Path:
+    """A Hermes source checkout, when one exists (set HERMES_SRC to point at it)."""
+    env = os.environ.get("HERMES_SRC", "").strip()
+    if env:
+        return Path(env)
+    for rel in ("src/hermes-agent", "hermes-agent"):
+        cand = Path.home() / rel
+        if cand.is_dir():
+            return cand
+    return Path.home() / "src" / "hermes-agent"
+
+
+HERMES_SRC = _hermes_src()
+
+try:
+    import agent.context_compressor  # noqa: F401
+
+    _HERMES_IMPORTABLE = True
+except Exception:
+    _HERMES_IMPORTABLE = False
+
+
+def _host_engine(name: str):
+    """Stub the host config's context.engine value."""
+    pkg = types.ModuleType("hermes_cli")
+    cfg_mod = types.ModuleType("hermes_cli.config")
+    cfg_mod.read_raw_config = lambda: {"context": {"engine": name}}
+    pkg.config = cfg_mod  # type: ignore[attr-defined]
+    return patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.config": cfg_mod})
 
 
 def _load():
@@ -18,6 +60,32 @@ def _load():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+class FakeCtx:
+    """Minimal public PluginContext surface (mirrors the shipped capability probe)."""
+
+    def __init__(self) -> None:
+        self.hooks: list[str] = []
+        self.middleware: list[str] = []
+        self.tools: list[str] = []
+        self.commands: list[str] = []
+        self.engines: list[object] = []
+
+    def register_hook(self, name, callback):
+        self.hooks.append(str(name))
+
+    def register_middleware(self, kind, callback):
+        self.middleware.append(str(kind))
+
+    def register_tool(self, name, *args, **kwargs):
+        self.tools.append(str(name))
+
+    def register_command(self, name, *args, **kwargs):
+        self.commands.append(str(name))
+
+    def register_context_engine(self, engine):
+        self.engines.append(engine)
 
 
 class Pins(unittest.TestCase):
@@ -84,144 +152,169 @@ class Names(unittest.TestCase):
         self.assertNotIn(".reasoning_effort", src)
 
 
-class HostStomp(unittest.TestCase):
+class Middleware(unittest.TestCase):
+    """llm_request is the only place the model changes."""
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.mod = _load()
 
     def setUp(self) -> None:
         with self.mod._lock:
-            self.mod._good_routes.clear()
+            self.mod._last_tier.clear()
+            self.mod._refused.clear()
+            self.mod._pinned.clear()
 
-    def test_repair_restores_snapshotted_host(self) -> None:
-        agent = SimpleNamespace(
-            model="deepseek-v4-pro",
-            provider="deepseek",
-            api_key="k1",
-            base_url="https://api.deepseek.com",
-            _client_kwargs={"base_url": "https://api.deepseek.com", "api_key": "k1"},
-        )
-        self.mod._remember_route(agent)
-        agent.base_url = "https://api.x.ai/v1"
-        agent.api_key = "k2"
-        agent._client_kwargs = {
-            "base_url": "https://api.x.ai/v1",
-            "api_key": "k2",
+    def _tier_provider(self, tier: str) -> str:
+        return str(self.mod.MODELS[tier]["provider"])
+
+    def test_rewrites_only_the_model(self) -> None:
+        tier = "high"
+        with self.mod._lock:
+            self.mod._last_tier["s1"] = tier
+        request = {
+            "model": "some-session-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
         }
-        self.assertTrue(self.mod._repair_host_stomp(agent))
-        self.assertEqual(agent.base_url, "https://api.deepseek.com")
-        self.assertEqual(agent._client_kwargs["base_url"], "https://api.deepseek.com")
-        self.assertEqual(agent.api_key, "k1")
-        self.assertEqual(agent._client_kwargs["api_key"], "k1")
-
-    def test_repair_keeps_key_when_snapshot_empty(self) -> None:
-        agent = SimpleNamespace(
-            model="deepseek-v4-pro",
-            provider="deepseek",
-            api_key="",
-            base_url="https://api.deepseek.com",
-            _client_kwargs={"base_url": "https://api.deepseek.com", "api_key": ""},
+        out = self.mod.on_llm_request(
+            request=request,
+            session_id="s1",
+            platform="cli",
+            model="some-session-model",
+            provider=self._tier_provider(tier),
         )
-        self.mod._remember_route(agent)
-        agent.base_url = "https://api.x.ai/v1"
-        agent.api_key = "k2"
-        agent._client_kwargs = {
-            "base_url": "https://api.x.ai/v1",
-            "api_key": "k2",
-        }
-        self.assertTrue(self.mod._repair_host_stomp(agent))
-        self.assertEqual(agent.base_url, "https://api.deepseek.com")
-        self.assertEqual(agent.api_key, "k2")
-        self.assertEqual(agent._client_kwargs["api_key"], "k2")
+        self.assertIsNotNone(out)
+        assert out is not None
+        new_request = out["request"]
+        self.assertEqual(new_request["model"], self.mod.MODELS[tier]["model"])
+        self.assertEqual(new_request["temperature"], 0.2)
+        self.assertEqual(new_request["messages"], request["messages"])
+        # The payload handed in is never mutated in place.
+        self.assertEqual(request["model"], "some-session-model")
 
-    def test_repair_ignores_matching_host(self) -> None:
-        agent = SimpleNamespace(
-            model="deepseek-v4-pro",
-            provider="deepseek",
-            base_url="https://api.deepseek.com",
-            _client_kwargs={"base_url": "https://api.deepseek.com"},
+    def test_no_tier_no_rewrite(self) -> None:
+        self.assertIsNone(
+            self.mod.on_llm_request(
+                request={"model": "m"},
+                session_id="untouched",
+                platform="cli",
+                model="m",
+                provider=self._tier_provider("low"),
+            )
         )
-        self.mod._remember_route(agent)
-        self.assertFalse(self.mod._repair_host_stomp(agent))
 
-    def test_repair_skips_when_model_changed(self) -> None:
-        agent = SimpleNamespace(
-            model="deepseek-v4-pro",
-            provider="deepseek",
-            base_url="https://api.deepseek.com",
-            _client_kwargs={"base_url": "https://api.deepseek.com"},
+    def test_matching_model_is_not_replaced(self) -> None:
+        tier = "low"
+        model = self.mod.MODELS[tier]["model"]
+        with self.mod._lock:
+            self.mod._last_tier["s2"] = tier
+        self.assertIsNone(
+            self.mod.on_llm_request(
+                request={"model": model},
+                session_id="s2",
+                platform="cli",
+                model=model,
+                provider=self._tier_provider(tier),
+            )
         )
-        self.mod._remember_route(agent)
-        agent.model = "grok-4.6"
-        agent.provider = "xai-oauth"
-        agent.base_url = "https://api.x.ai/v1"
-        self.assertFalse(self.mod._repair_host_stomp(agent))
+
+    def test_foreign_provider_is_refused(self) -> None:
+        tier = "high"
+        with self.mod._lock:
+            self.mod._last_tier["s3"] = tier
+        out = self.mod.on_llm_request(
+            request={"model": "session-model"},
+            session_id="s3",
+            platform="cli",
+            model="session-model",
+            provider="an-unrelated-provider",
+            base_url="https://example.invalid/v1",
+        )
+        self.assertIsNone(out)
+        with self.mod._lock:
+            self.assertEqual(self.mod._refused.get("s3"), self._tier_provider(tier))
+
+    def test_fallback_model_outranks_the_tier(self) -> None:
+        # A fallback/rotation already changed the payload's model; the tier must
+        # not fight it back.
+        with self.mod._lock:
+            self.mod._last_tier["s4"] = "high"
+        self.assertIsNone(
+            self.mod.on_llm_request(
+                request={"model": "fallback-model"},
+                session_id="s4",
+                platform="cli",
+                model="session-model",
+                provider=self._tier_provider("high"),
+            )
+        )
+
+    def test_cron_and_subagent_platforms_are_skipped(self) -> None:
+        with self.mod._lock:
+            self.mod._last_tier["s5"] = "high"
+        for platform, kwargs in (("cron", {}), ("cli", {"parent_session_id": "parent"})):
+            self.assertIsNone(
+                self.mod.on_llm_request(
+                    request={"model": "session-model"},
+                    session_id="s5",
+                    platform=platform,
+                    model="session-model",
+                    provider=self._tier_provider("high"),
+                    **kwargs,
+                )
+            )
 
 
-class CaptureWrap(unittest.TestCase):
-    """WebUI inspect.signature follows the wrap; **kwargs looked like support."""
+class RegisteredSurface(unittest.TestCase):
+    """The plugin extends Hermes through public surfaces only."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.mod = _load()
 
-    @staticmethod
-    def _supports_kwarg(func, kwarg_name: str) -> bool:
-        # Mirror hermes-webui api.streaming._supports_kwarg.
-        import inspect as inspect_mod
+    def _register(self, host_engine: str = "compressor"):
+        ctx = FakeCtx()
+        with _host_engine(host_engine):
+            self.mod.register(ctx)
+        return ctx
 
-        sig = inspect_mod.signature(func)
-        return any(
-            param.kind == param.VAR_KEYWORD or param.name == kwarg_name
-            for param in sig.parameters.values()
-        )
+    def test_declared_surface_matches_plugin_yaml(self) -> None:
+        manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        for hook in ("pre_llm_call", "post_tool_call"):
+            self.assertIn(hook, manifest)
+        self.assertIn("llm_request", manifest)
+        self.assertNotIn("pre_api_request", manifest)
 
-    def test_wrap_does_not_advertise_revision_kwarg(self) -> None:
-        class Agent:
-            def run_conversation(
-                self,
-                user_message,
-                conversation_history=None,
-            ):
-                return user_message
+    def test_registers_hooks_middleware_tool_and_commands(self) -> None:
+        ctx = self._register()
+        self.assertEqual(sorted(ctx.hooks), ["post_tool_call", "pre_llm_call"])
+        self.assertEqual(ctx.middleware, ["llm_request"])
+        self.assertEqual(ctx.tools, ["escalate_model"])
+        self.assertEqual(sorted(ctx.commands), ["auto", "default", "high", "low"])
 
-        def factory(orig):
-            def wrapped_run(self, *args, **kwargs):
-                return orig(self, *args, **kwargs)
+    def test_no_internals_are_touched(self) -> None:
+        src = (ROOT / "__init__.py").read_text(encoding="utf-8")
+        for banned in (
+            "_replace_primary_openai_client",
+            "_client_kwargs",
+            "setattr(",
+            "MutationObserver",
+            "_install_agent_capture",
+            "_wrap_cls_method",
+            "switch_model(",
+            "_cli_ref",
+            "auxiliary_client",
+        ):
+            self.assertNotIn(banned, src)
 
-            return wrapped_run
-
-        self.assertTrue(self.mod._wrap_cls_method(Agent, "run_conversation", factory))
-        self.assertFalse(
-            self._supports_kwarg(
-                Agent().run_conversation,
-                "conversation_history_revision",
-            )
-        )
-
-    def test_wrap_drops_unknown_kwargs(self) -> None:
-        seen: dict = {}
-
-        class Agent:
-            def run_conversation(self, user_message, conversation_history=None):
-                seen["user_message"] = user_message
-                seen["conversation_history"] = conversation_history
-                return "ok"
-
-        def factory(orig):
-            def wrapped_run(self, *args, **kwargs):
-                return orig(self, *args, **kwargs)
-
-            return wrapped_run
-
-        self.mod._wrap_cls_method(Agent, "run_conversation", factory)
-        result = Agent().run_conversation(
-            user_message="hi",
-            conversation_history=[],
-            conversation_history_revision={"session_id": "s1"},
-        )
-        self.assertEqual(result, "ok")
-        self.assertEqual(seen, {"user_message": "hi", "conversation_history": []})
+    @unittest.skipUnless(HERMES_SRC.is_dir(), "needs a Hermes checkout")
+    def test_engine_registers_only_when_the_host_names_it(self) -> None:
+        if str(HERMES_SRC) not in sys.path:
+            sys.path.insert(0, str(HERMES_SRC))
+        install_engine_stub()
+        self.assertEqual(len(self._register("model-picker").engines), 1)
+        self.assertEqual(self._register("compressor").engines, [])
 
 
 if __name__ == "__main__":
