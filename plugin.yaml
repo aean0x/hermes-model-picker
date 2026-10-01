@@ -1,22 +1,27 @@
 name: model-picker
-version: 0.11.1
+version: 0.12.0
 description: >-
   Per-turn cost classifier across three named tiers (low / default / high),
   labelled Quick / Standard / Expert. Classifies each user turn from best_for
   (high only for money / irreversible / security), biased to keep the previous
-  tier unless scope/topic changes (high never sticks). A classifier-driven
-  tier change compacts the transcript before the switch. Escalates on tool
-  failures via escalate_model. Pins with /low /default /high /auto; `/medium`
-  is the deprecated alias for `/default`. Model id and provider come from
-  config.json (Nix hermesPnP.models), a MODEL_PICKER_CONFIG path, or
-  MODEL_PICKER_* env; with none of those, all three tiers default to the model the
-  Hermes config names as primary — no Hermes/WebUI core edits.
-  Also blocks credential-refresh host stomps.
+  tier unless scope/topic changes (high never sticks). The tier is applied by an
+  llm_request middleware that rewrites the request's model, so nothing is
+  patched: no client rebuild, no AIAgent attribute writes, no method wrapping,
+  no WebUI script. A classifier-driven tier change compacts the transcript
+  before the switch. Escalates on tool failures via escalate_model. Pins with
+  /low /default /high /auto; `/medium` is the deprecated alias for `/default`.
+  Model id and provider come from config.json (Nix hermesPnP.models), a
+  MODEL_PICKER_CONFIG path, or MODEL_PICKER_* env; with none of those, all three
+  tiers default to the model the Hermes config names as primary — no
+  Hermes/WebUI core edits. All three tiers must resolve to the session's own
+  provider: a middleware can rewrite the model id, not the API host.
 author: aean0x
 kind: standalone
+requires_hermes: ">=0.21.5"
 provides_hooks:
   - pre_llm_call
-  - pre_api_request
   - post_tool_call
+provides_middleware:
+  - llm_request
 provides_tools:
   - escalate_model
