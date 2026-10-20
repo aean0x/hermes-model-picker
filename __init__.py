@@ -1,10 +1,21 @@
-"""model-picker — per-turn cost routing for Hermes across three named tiers.
+"""model-picker — classify each turn, pick a model tier, on public surfaces only.
 
 Exactly three models: low < default < high. Models, providers, labels, and
-escalation are config — see settings.py and config.default.json. Override via
-a plugin-adjacent config.json, a MODEL_PICKER_CONFIG path, or MODEL_PICKER_*
-env vars. "medium" is the deprecated alias for "default" and still pins the
-default slot.
+escalation are config — see settings.py and config.default.json. Override via a
+plugin-adjacent config.json, a MODEL_PICKER_CONFIG path, or MODEL_PICKER_* env
+vars. "medium" is the deprecated alias for "default" and still pins the default
+slot.
+
+Every extension point here is a documented plugin surface:
+
+  • rating      — ``pre_llm_call`` observes the turn and produces the tier;
+  • model choice — ``llm_request`` middleware rewrites the outgoing request's
+    ``model`` before the provider call. Nothing else is touched: no client
+    rebuild, no ``AIAgent`` attribute writes, no method wrapping, and no WebUI
+    DOM script;
+  • classifier  — ``ctx.llm`` (host-owned completions on the active model);
+  • handoff     — ``ctx.register_context_engine`` (the public single-engine
+    slot), active only when the host config names this engine.
 
 Policy:
   • Each real user turn is classified once; the work loop stays on that tier
@@ -15,31 +26,26 @@ Policy:
     scope/topic is unchanged (low/default only; high is never sticky).
   • A classifier-driven tier change compacts the transcript before the switch
     so the new model cold-reads a summary (explicit pins/escalation skip this).
-  • Consecutive tool errors climb one tier, capped at escalate_max.
-  • Manual /low /default /high pins pause auto-routing until /auto. /medium
-    is the deprecated form of /default.
+  • Consecutive tool errors stage an escalation checkpoint; the working model
+    calls escalate_model to climb one tier.
+  • Manual /low /default /high pins pause auto-routing until /auto. /medium is
+    the deprecated form of /default.
   • Slash pins must start the message; a mid-paragraph /high is not a pin.
-  • Classifier matrices (`best_for`) are config — Nix / config.json / env.
-  • Client rebuilds that pair the live provider with the previous API host
-    (WebUI credential_refresh) are refused at `_replace_primary_openai_client`.
-    pre_api_request still re-heals if a stomp lands between rebuilds.
 
-No Hermes/WebUI core file edits. Live switch uses AIAgent.switch_model via
-the same hermes_cli.model_switch resolver as /model (native providers, not
-OpenRouter slugs). Agent capture is deferred so register() cannot circular-
-import run_agent. Does not write SOUL.md.
+Tier scope. An ``llm_request`` middleware can rewrite the model id, not the
+API host: the client for the request is built from the session's provider. All
+three tiers must therefore resolve to the session's own provider. A tier that
+names a different provider is refused (logged once) and the session's model
+stands.
 """
 
 from __future__ import annotations
 
-import functools
 import importlib.util
-import inspect
 import logging
 import os
 import re
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -70,11 +76,11 @@ as_name = _s.as_name
 _ESCALATE_MAX = _s.ESCALATE_MAX
 _ESCALATION_ERRORS = _s.ESCALATION_ERRORS
 _SKIP_PLATFORMS = _s.SKIP_PLATFORMS
-_PROVIDER_HOSTS = _s.PROVIDER_HOSTS
 _CLASSIFIER = _s.CLASSIFIER
-_HANDOFF_TAIL_CHARS = _s.HANDOFF_TAIL_CHARS
 _CLASSIFIER_CONTEXT_CHARS = _s.CLASSIFIER_CONTEXT_CHARS
 _CLASSIFIER_TIMEOUT_S = _s.CLASSIFIER_TIMEOUT_S
+_CLASSIFIER_MODEL = getattr(_s, "CLASSIFIER_MODEL", "")
+_CLASSIFIER_PROVIDER = getattr(_s, "CLASSIFIER_PROVIDER", "")
 # False when no tier has a model id and the host has no primary model either.
 # The full surface still registers (declared == registered for the validator);
 # the hooks simply decline to classify, so registration never raises.
@@ -83,6 +89,12 @@ _UNCONFIGURED_SLOTS = tuple(getattr(_s, "UNCONFIGURED_SLOTS", ()))
 _MIN = "low"
 _MID = "default"
 _TOP = NAMES[-1]  # "high"
+
+# Host-owned PluginContext (set in register()). Only public attributes are read
+# from it: .llm for the classifier, .get_config for operator knobs.
+_ctx: Any = None
+# The single engine instance the plugin system holds. Each agent gets a clone.
+_engine: Any = None
 
 
 def _attach_file_handler() -> None:
@@ -150,7 +162,7 @@ _WEBUI_WORKSPACE_RE = re.compile(
     re.IGNORECASE,
 )
 # Slash pin only at the start of the message (after the WebUI workspace prefix).
-# Mid-paragraph "/high" in a bug report must not route to grok.
+# Mid-paragraph "/high" in a bug report must not route to a stronger model.
 _SLASH_PIN_RE = re.compile(
     rf"^/({_TIER_WORD})\b",
     re.IGNORECASE,
@@ -164,17 +176,15 @@ _PIN_PHRASE_RE = re.compile(
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?]+\s+|\n+")
 
 _lock = threading.Lock()
-_live_agents: dict[str, Any] = {}
-_last_bound: tuple[str, Any] | None = None
 _last_user_sid: str = ""  # session of the most recent real user turn (command anchor)
 _pinned: dict[str, bool] = {}
 _last_tier: dict[str, str] = {}
 _last_msg: dict[str, tuple[str, str]] = {}  # (msg, tier) to skip re-classifying a repeat
 _tool_errors: dict[str, int] = {}
 _checkpoint: dict[str, bool] = {}  # session -> escalation checkpoint nudge pending
-_good_routes: dict[int, dict[str, str]] = {}
-_manager = None
-_patched = False
+_compact: dict[str, bool] = {}  # session -> one-shot forced compaction at next boundary
+_handoff: dict[str, dict[str, Any]] = {}  # session -> handoff for the context engine
+_refused: dict[str, str] = {}  # session -> provider a tier was refused for (log once)
 
 # Injected into the next tool-continuation turn when an escalation checkpoint
 # is pending. The working model (not the classifier) decides whether to call
@@ -192,432 +202,42 @@ def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 
-def _agent_base_url(agent: Any) -> str:
-    """Prefer live client kwargs base — WebUI credential refresh can desync attrs."""
-    if agent is None:
-        return ""
-    kw = getattr(agent, "_client_kwargs", None) or {}
-    if isinstance(kw, dict):
-        b = (kw.get("base_url") or "").strip()
-        if b:
-            return b
-    return (getattr(agent, "base_url", "") or "").strip()
-
-
 def _strip_platform_prefix(msg: str) -> str:
-    return _WEBUI_WORKSPACE_RE.sub("", (msg or "").strip()).strip()
+    return _WEBUI_WORKSPACE_RE.sub("", msg or "")
 
 
 def _sentence_count(msg: str) -> int:
-    text = _strip_platform_prefix(msg)
-    if not text:
-        return 0
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    parts = [p for p in _SENTENCE_SPLIT_RE.split(msg or "") if p.strip()]
     return max(1, len(parts))
 
 
-def _base_url_matches_provider(base_url: str, provider: str) -> bool:
-    """Detect half-switched agents (model name set, still on previous API host)."""
-    base = _norm(base_url)
-    prov = _norm(provider)
-    if not base or not prov:
-        return True  # unknown — let switch_model decide
-    spec = _PROVIDER_HOSTS.get(prov)
-    if not spec:
-        return True
-    forbid = spec.get("forbid") or []
-    prefer = spec.get("prefer") or []
-    if any(token in base for token in forbid):
-        return False
-    if prefer and any(token in base for token in prefer):
-        return True
-    return True
+def _provider_matches(want: str, got: str) -> bool:
+    """True when a tier's provider can ride the session's provider.
 
-
-def _same_route(agent: Any, model: str, provider: str) -> bool:
-    if _norm(getattr(agent, "model", "")) != _norm(model):
-        return False
-    if _norm(getattr(agent, "provider", "")) != _norm(provider):
-        return False
-    base = _agent_base_url(agent)
-    if not _base_url_matches_provider(base, provider):
-        logger.warning(
-            "model-picker: half-switch detected model=%s provider=%s base_url=%s — re-applying",
-            getattr(agent, "model", ""),
-            getattr(agent, "provider", ""),
-            base,
-        )
-        return False
-    return True
-
-
-def _set_agent_base_url(agent: Any, base: str) -> None:
-    agent.base_url = base
-    kw = getattr(agent, "_client_kwargs", None)
-    if isinstance(kw, dict):
-        kw = dict(kw)
-        kw["base_url"] = base
-        agent._client_kwargs = kw
-
-
-def _agent_api_key(agent: Any) -> str:
-    kw = getattr(agent, "_client_kwargs", None)
-    if isinstance(kw, dict):
-        key = kw.get("api_key")
-        if key:
-            return str(key)
-    return str(getattr(agent, "api_key", "") or "")
-
-
-def _set_agent_api_key(agent: Any, key: str) -> None:
-    agent.api_key = key
-    kw = getattr(agent, "_client_kwargs", None)
-    if isinstance(kw, dict):
-        kw = dict(kw)
-        kw["api_key"] = key
-        agent._client_kwargs = kw
-
-
-def _remember_route(agent: Any) -> None:
-    """Snapshot a coherent model/provider/host/key for host-stomp repair."""
-    if agent is None:
-        return
-    model = getattr(agent, "model", "") or ""
-    provider = getattr(agent, "provider", "") or ""
-    base = _agent_base_url(agent)
-    if not (model and provider and base):
-        return
-    if not _base_url_matches_provider(base, provider):
-        return
-    with _lock:
-        _good_routes[id(agent)] = {
-            "model": _norm(model),
-            "provider": _norm(provider),
-            "base_url": base,
-            "api_key": _agent_api_key(agent),
-        }
-
-
-def _repair_host_stomp(agent: Any) -> bool:
-    """Undo a credential-refresh write that put the live provider on the old host.
-
-    WebUI `_refresh_cached_agent_runtime` copies base_url *and* api_key from
-    the request's original kwargs while leaving model/provider. Restore the
-    last coherent host+key for this (model, provider) instead of rebuilding
-    the client on DeepSeek's URL with the session's xAI key (HTTP 401).
+    The request's client is built from the session provider, so the two must be
+    the same API host. Provider ids carry suffixes and aliases in practice
+    ("deepseek" / "deepseek-chat"), so a containment test is the honest check;
+    unknown values (empty) pass and the host decides.
     """
-    if agent is None:
-        return False
-    model = _norm(getattr(agent, "model", "") or "")
-    provider = _norm(getattr(agent, "provider", "") or "")
-    base = _agent_base_url(agent)
-    if not (model and provider):
-        return False
-
-    with _lock:
-        snap = _good_routes.get(id(agent))
-    if not (
-        snap
-        and snap.get("model") == model
-        and snap.get("provider") == provider
-        and snap.get("base_url")
-        and _norm(snap["base_url"]) != _norm(base)
-    ):
-        return False
-    want = snap["base_url"]
-    if not want or _norm(want) == _norm(base):
-        return False
-    logger.warning(
-        "model-picker: blocked host stomp model=%s provider=%s was=%s restore=%s",
-        getattr(agent, "model", ""),
-        getattr(agent, "provider", ""),
-        base,
-        want,
-    )
-    _set_agent_base_url(agent, want)
-    key = snap.get("api_key") or ""
-    if key:
-        _set_agent_api_key(agent, key)
-    return True
-
-
-def bind_agent(session_id: str, agent: Any) -> None:
-    if agent is None:
-        return
-    global _last_bound
-    sid = session_id or getattr(agent, "session_id", None) or ""
-    with _lock:
-        if sid:
-            _live_agents[sid] = agent
-        _last_bound = (sid, agent)
-
-
-def _get_agent(session_id: str = "") -> Any | None:
-    sid = session_id or ""
-    with _lock:
-        if sid and sid in _live_agents:
-            return _live_agents[sid]
-        bound = _last_bound
-        live_items = list(_live_agents.items())
-
-    def _ok(agent: Any) -> bool:
-        if agent is None:
-            return False
-        if not sid:
-            return True
-        agent_sid = getattr(agent, "session_id", "") or ""
-        return (not agent_sid) or agent_sid == sid
-
-    if _manager is not None:
-        try:
-            cli = getattr(_manager, "_cli_ref", None)
-            agent = getattr(cli, "agent", None) if cli else None
-            if _ok(agent):
-                bind_agent(sid, agent)
-                return agent
-        except Exception:
-            pass
-
-    if bound is not None and _ok(bound[1]):
-        bind_agent(sid, bound[1])
-        return bound[1]
-
-    for mapped_sid, agent in live_items:
-        if _ok(agent):
-            bind_agent(sid or mapped_sid, agent)
-            return agent
-    return None
-
-
-def _kwargs_accepted_by(orig: Any, kwargs: dict) -> dict:
-    """Drop kwargs the original callable cannot take.
-
-    WebUI inspects AIAgent.run_conversation and treats a ``**kwargs`` wrapper
-    as supporting conversation_history_revision. The agent at our pin does
-    not; forwarding that kwarg TypeErrors every session.
-    """
-    try:
-        sig = inspect.signature(orig)
-    except (TypeError, ValueError):
-        return kwargs
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-        return kwargs
-    allowed = {
-        name
-        for name, param in sig.parameters.items()
-        if param.kind
-        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    }
-    return {key: value for key, value in kwargs.items() if key in allowed}
-
-
-def _wrap_cls_method(cls: Any, name: str, factory: Any) -> bool:
-    orig = getattr(cls, name, None)
-    if orig is None:
-        return False
-    if getattr(orig, "_model_picker_wrapped", False):
+    a, b = _norm(want), _norm(got)
+    if not a or not b:
         return True
-    inner = factory(orig)
-
-    @functools.wraps(orig)
-    def wrapped(self, *args, **kwargs):
-        return inner(self, *args, **_kwargs_accepted_by(orig, kwargs))
-
-    wrapped._model_picker_wrapped = True  # type: ignore[attr-defined]
-    setattr(cls, name, wrapped)
-    return True
+    return a == b or a in b or b in a
 
 
-def _install_agent_capture() -> None:
-    global _patched
-    try:
-        import run_agent
-    except Exception as exc:
-        logger.warning("model-picker: cannot import run_agent for capture: %s", exc)
-        return
-
-    cls = run_agent.AIAgent
-
-    def wrap_init(orig):
-        def wrapped_init(self, *args, **kwargs):
-            orig(self, *args, **kwargs)
-            bind_agent(getattr(self, "session_id", None) or "", self)
-            _remember_route(self)
-
-        return wrapped_init
-
-    def wrap_run(orig):
-        def wrapped_run(self, *args, **kwargs):
-            bind_agent(getattr(self, "session_id", None) or "", self)
-            return orig(self, *args, **kwargs)
-
-        return wrapped_run
-
-    def wrap_switch(orig):
-        def wrapped_switch(self, *args, **kwargs):
-            result = orig(self, *args, **kwargs)
-            _remember_route(self)
-            return result
-
-        return wrapped_switch
-
-    def wrap_replace(orig):
-        def wrapped_replace(self, *args, **kwargs):
-            repaired = _repair_host_stomp(self)
-            prov = getattr(self, "provider", "") or ""
-            if not repaired and not _base_url_matches_provider(_agent_base_url(self), prov):
-                logger.warning(
-                    "model-picker: skip client rebuild on unresolved host mismatch "
-                    "model=%s provider=%s base_url=%s",
-                    getattr(self, "model", ""),
-                    prov,
-                    _agent_base_url(self),
-                )
-                # True: WebUI treats False as "rebuild from original kwargs"
-                # (the session's xAI host). Keep the live client instead.
-                return True
-            result = orig(self, *args, **kwargs)
-            _remember_route(self)
-            return result
-
-        return wrapped_replace
-
-    _wrap_cls_method(cls, "__init__", wrap_init)
-    _wrap_cls_method(cls, "run_conversation", wrap_run)
-    _wrap_cls_method(cls, "switch_model", wrap_switch)
-    if not _wrap_cls_method(cls, "_replace_primary_openai_client", wrap_replace):
-        logger.info(
-            "model-picker: AIAgent has no _replace_primary_openai_client; "
-            "host-stomp guard is pre_api_request only"
-        )
-    _patched = True
-    logger.info("model-picker: AIAgent capture installed")
+def _tier_model(name: str) -> str:
+    meta = MODELS.get(name) or {}
+    return str(meta.get("model") or "").strip()
 
 
-def _apply_tier(agent: Any, name: str) -> bool:
-    meta = MODELS.get(name)
-    if not meta or agent is None:
-        return False
-    model = meta["model"]
-    provider = meta["provider"]
-    if _same_route(agent, model, provider):
-        _remember_route(agent)
-        return True
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.model_switch import switch_model as resolve_switch
-    except Exception as exc:
-        logger.warning("model-picker: model_switch import failed: %s", exc)
-        return False
+def _tier_provider(name: str) -> str:
+    meta = MODELS.get(name) or {}
+    return str(meta.get("provider") or "").strip()
 
-    try:
-        cfg = load_config() or {}
-        # When half-switched (model name on the wrong API host), pass a
-        # neutral current_base_url so resolve does not inherit the old host.
-        cur_base = _agent_base_url(agent)
-        cur_prov = getattr(agent, "provider", "") or ""
-        if not _base_url_matches_provider(cur_base, provider):
-            cur_base = ""
-            cur_prov = provider
-        result = resolve_switch(
-            raw_input=model,
-            current_provider=cur_prov,
-            current_model=getattr(agent, "model", "") or "",
-            current_base_url=cur_base,
-            current_api_key=getattr(agent, "api_key", "") or "",
-            is_global=False,
-            explicit_provider=provider,
-            user_providers=cfg.get("providers"),
-            custom_providers=cfg.get("custom_providers"),
-        )
-    except Exception as exc:
-        logger.warning("model-picker: resolve %s failed: %s", name, exc)
-        return False
 
-    if not getattr(result, "success", False):
-        logger.warning(
-            "model-picker: resolve %s failed: %s",
-            name,
-            getattr(result, "error_message", "unknown"),
-        )
-        return False
-
-    resolved_base = (getattr(result, "base_url", None) or "").strip()
-    resolved_prov = getattr(result, "target_provider", None) or provider
-    if not resolved_base:
-        logger.warning(
-            "model-picker: resolve %s returned empty base_url for %s/%s",
-            name,
-            resolved_prov,
-            getattr(result, "new_model", model),
-        )
-        return False
-    if not _base_url_matches_provider(resolved_base, resolved_prov):
-        logger.warning(
-            "model-picker: resolve %s host mismatch provider=%s base_url=%s",
-            name,
-            resolved_prov,
-            resolved_base,
-        )
-        return False
-
-    try:
-        agent.switch_model(
-            result.new_model,
-            resolved_prov,
-            result.api_key or "",
-            resolved_base,
-            result.api_mode or "",
-        )
-    except Exception as exc:
-        logger.warning("model-picker: switch_model %s failed: %s", name, exc)
-        return False
-
-    # Jurisdiction is model/provider only. Session reasoning stays
-    # whatever Hermes set. Auxiliary effort is Nix-seeded, not here.
-
-    # Prefer agent attributes; fall back to what we just applied.
-    live_model = getattr(agent, "model", "") or result.new_model
-    live_prov = getattr(agent, "provider", "") or resolved_prov
-    live_base = getattr(agent, "base_url", "") or resolved_base
-    # Some hermes builds keep a nested client; best-effort read.
-    try:
-        client = getattr(agent, "client", None) or getattr(agent, "_client", None)
-        client_base = getattr(client, "base_url", None) if client is not None else None
-        if client_base is not None:
-            live_base = str(client_base) or live_base
-    except Exception:
-        pass
-
-    if _norm(live_model) != _norm(result.new_model) or _norm(live_prov) != _norm(
-        resolved_prov
-    ):
-        logger.warning(
-            "model-picker: post-switch attrs mismatch want=%s/%s got=%s/%s",
-            resolved_prov,
-            result.new_model,
-            live_prov,
-            live_model,
-        )
-        return False
-    if not _base_url_matches_provider(live_base, resolved_prov):
-        logger.warning(
-            "model-picker: post-switch base_url still wrong for %s: provider=%s base_url=%s",
-            name,
-            resolved_prov,
-            live_base,
-        )
-        return False
-
-    logger.info(
-        "model-picker: applied %s → %s / %s (base=%s)",
-        meta["label"],
-        resolved_prov,
-        result.new_model,
-        live_base or "-",
-    )
-    _remember_route(agent)
-    return True
+def _current_tier(session_id: str) -> str | None:
+    with _lock:
+        return _last_tier.get(session_id or "")
 
 
 def _token_to_name(*parts: str | None) -> str | None:
@@ -661,76 +281,66 @@ def _detect_explicit_tier(msg: str) -> str | None:
     return None
 
 
-def _resolve_tier_runtime(name: str, agent: Any) -> dict[str, str] | None:
-    """Resolve (model, provider, base_url, api_key, api_mode) for a tier without switching.
+def _classifier_text(response: Any) -> str:
+    """Read the completion text off whatever the host facade returned."""
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        return text.strip()
+    try:
+        return str(response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
 
-    Reuses the same ``resolve_switch`` path as ``_apply_tier`` so the classifier
-    and the escalate tool can address a tier's model/provider directly. Returns
-    None on any failure.
+
+def _classifier_complete(messages: list[dict[str, Any]]) -> str:
+    """One bounded completion through the host-owned plugin LLM facade.
+
+    ``ctx.llm`` overrides are fail-closed: a model/provider the host has not
+    allowed for this plugin raises, in which case the same request is retried
+    on the active model rather than losing the classification.
     """
-    meta = MODELS.get(name)
-    if not meta:
-        return None
-    model = meta["model"]
-    provider = meta["provider"]
+    llm = getattr(_ctx, "llm", None) if _ctx is not None else None
+    if llm is None:
+        raise RuntimeError("no ctx.llm facade")
+    call: dict[str, Any] = {
+        "messages": messages,
+        "max_tokens": 8,
+        "temperature": 0.0,
+        # Hard cap so this advisory call can never eat the gateway's 30s hook
+        # budget (pre_llm_call). On timeout _classify fails open to low — the
+        # turn proceeds, escalation corrects a miss later.
+        "timeout": _CLASSIFIER_TIMEOUT_S,
+    }
+    overrides: dict[str, Any] = {}
+    if _CLASSIFIER_MODEL:
+        overrides["model"] = _CLASSIFIER_MODEL
+    if _CLASSIFIER_PROVIDER:
+        overrides["provider"] = _CLASSIFIER_PROVIDER
     try:
-        from hermes_cli.config import load_config
-        from hermes_cli.model_switch import switch_model as resolve_switch
-    except Exception as exc:
-        logger.warning("model-picker: model_switch import failed: %s", exc)
-        return None
-    try:
-        cfg = load_config() or {}
-        cur_base = _agent_base_url(agent)
-        cur_prov = getattr(agent, "provider", "") or ""
-        if not _base_url_matches_provider(cur_base, provider):
-            cur_base = ""
-            cur_prov = provider
-        result = resolve_switch(
-            raw_input=model,
-            current_provider=cur_prov,
-            current_model=getattr(agent, "model", "") or "",
-            current_base_url=cur_base,
-            current_api_key=getattr(agent, "api_key", "") or "",
-            is_global=False,
-            explicit_provider=provider,
-            user_providers=cfg.get("providers"),
-            custom_providers=cfg.get("custom_providers"),
+        return _classifier_text(llm.complete(**call, **overrides))
+    except Exception:
+        if not overrides:
+            raise
+        logger.warning(
+            "model-picker: classifier override %s/%s refused by the host policy; "
+            "using the active model",
+            _CLASSIFIER_PROVIDER or "-",
+            _CLASSIFIER_MODEL or "-",
         )
-        if not getattr(result, "success", False):
-            return None
-        base = (getattr(result, "base_url", None) or "").strip()
-        prov = getattr(result, "target_provider", None) or provider
-        if not base or not _base_url_matches_provider(base, prov):
-            return None
-        return {
-            "model": getattr(result, "new_model", model),
-            "provider": prov,
-            "base_url": base,
-            "api_key": result.api_key or "",
-            "api_mode": result.api_mode or "",
-        }
-    except Exception as exc:
-        logger.warning("model-picker: resolve %s runtime failed: %s", name, exc)
-        return None
+        return _classifier_text(llm.complete(**call))
 
 
 def _classify(user_message: str, history: list, session_id: str = "") -> str:
     """Return low|default|high. Fail-open to low — escalation corrects a miss.
 
-    Runs on the previous turn's tier (never ``high``/grok) with real history so
-    the classifier sees the same conversation the previous model already read.
-    The actual previous tier is surfaced in the request so the classifier can
-    prefer to stay put (low/default only; high is never sticky).
+    The classifier runs on the host's plugin-LLM route (the session's active
+    model, or the override the operator allowed for this plugin). It is given
+    the previous tier as a signal so it can prefer to stay put (low/default
+    only; high is never sticky).
     """
     try:
-        from agent.auxiliary_client import call_llm
-
         with _lock:
             prev_tier = _last_tier.get(session_id)
-        # Classifier runs on the previous tier's model, never high/grok.
-        prev = prev_tier if prev_tier in (_MIN, _MID) else _MID
-
         body = _strip_platform_prefix(user_message)
         system = _CLASSIFIER
         if prev_tier is not None:
@@ -766,28 +376,7 @@ def _classify(user_message: str, history: list, session_id: str = "") -> str:
             messages.append({"role": "assistant", "content": "Understood."})
         messages.append({"role": "user", "content": body[:800] or user_message[:800]})
 
-        call_kwargs: dict[str, Any] = {
-            "messages": messages,
-            "max_tokens": 8,
-            "temperature": 0.0,
-            # Hard cap so this advisory call can never eat the gateway's 30s
-            # hook budget (pre_llm_call).  On timeout _classify fails open to
-            # low — the turn proceeds, escalation corrects a miss later.
-            "timeout": _CLASSIFIER_TIMEOUT_S,
-        }
-        rt = _resolve_tier_runtime(prev, _get_agent(session_id))
-        if rt and rt.get("base_url"):
-            call_kwargs.update(
-                model=rt["model"],
-                provider=rt["provider"],
-                base_url=rt["base_url"],
-                api_key=rt["api_key"] or None,
-            )
-            response = call_llm(**call_kwargs)
-        else:
-            response = call_llm(task="triage_specifier", **call_kwargs)
-
-        raw = (response.choices[0].message.content or "").strip()
+        raw = _classifier_complete(messages)
         raw_l = raw.lower()
         allowed = (_MIN, _MID, _TOP)
         found = [n for n in allowed if re.search(rf"\b{n}\b", raw_l)]
@@ -840,50 +429,31 @@ def _target_tier(session_id: str, msg: str, history: list) -> tuple[str, str]:
 
 
 def _set_tier(session_id: str, name: str, reason: str) -> None:
-    """Record the target tier and switch the live agent onto it."""
+    """Record the tier for the session. The request middleware applies it."""
     with _lock:
         prev = _last_tier.get(session_id)
         _last_tier[session_id] = name
     if prev != name:
-        logger.info("model-picker: %s (%s) sid=%s", name, reason, session_id or "-")
-    agent = _get_agent(session_id)
-    if agent is None:
-        logger.warning(
-            "model-picker: %s (%s) no live agent sid=%s",
+        logger.info(
+            "model-picker: %s (%s) sid=%s model=%s -> %s",
             name,
             reason,
             session_id or "-",
-        )
-        return
-    if not _apply_tier(agent, name):
-        logger.warning(
-            "model-picker: %s apply failed sid=%s model=%s provider=%s base=%s",
-            name,
-            session_id or "-",
-            getattr(agent, "model", "") or "-",
-            getattr(agent, "provider", "") or "-",
-            _agent_base_url(agent) or "-",
+            _tier_model(name) or "-",
+            _tier_provider(name) or "-",
         )
 
 
-def _request_compaction(agent: Any) -> None:
-    """Ask the context engine to compact at the next turn boundary.
+def _take_compact(session_id: str) -> bool:
+    """Consume a pending forced-compaction request (called by the engine)."""
+    with _lock:
+        return bool(_compact.pop(session_id or "", False))
 
-    Set when a classifier-driven tier change swaps models, so the incoming
-    model cold-reads a compact summary instead of the full transcript. One-shot:
-    the engine clears the flag inside ``should_compress_info``. Mid-turn
-    escalation must NOT use this (compaction is unsafe mid-turn) — it keeps the
-    request-scoped handoff instead.
-    """
-    if agent is None:
-        return
-    engine = getattr(agent, "context_compressor", None)
-    if engine is None or not hasattr(engine, "force_compress_once"):
-        return
-    try:
-        engine.force_compress_once = True
-    except Exception as exc:
-        logger.warning("model-picker: force-compact flag failed: %s", exc)
+
+def _take_handoff(session_id: str) -> dict[str, Any] | None:
+    """Consume a pending escalation handoff (called by the engine)."""
+    with _lock:
+        return _handoff.pop(session_id or "", None)
 
 
 def _should_skip(platform: str, kwargs: dict) -> bool:
@@ -891,10 +461,79 @@ def _should_skip(platform: str, kwargs: dict) -> bool:
     if plat in _SKIP_PLATFORMS:
         return True
     # subagent = delegate_task children: model is pinned by delegation config.
-    parent = kwargs.get("parent_session_id") or ""
-    if parent:
+    if kwargs.get("parent_session_id") or "":
         return True
     return False
+
+
+def on_llm_request(
+    *,
+    request: dict | None = None,
+    session_id: str = "",
+    platform: str = "",
+    model: str = "",
+    provider: str = "",
+    **kwargs: Any,
+) -> dict | None:
+    """Rewrite the outgoing request's model to the session's tier.
+
+    Public middleware surface (``llm_request``): the payload handed in is the
+    mutable provider kwargs, and returning ``{"request": {...}}`` replaces it.
+    Only the ``model`` key is touched; the API host, auth and every other key
+    come from the session unchanged.
+    """
+    try:
+        if not _CONFIGURED or not isinstance(request, dict):
+            return None
+        if _should_skip(platform, kwargs):
+            return None
+        sid = session_id or ""
+        tier = _current_tier(sid)
+        if not tier:
+            return None
+        want = _tier_model(tier)
+        if not want:
+            return None
+        current = str(request.get("model") or "")
+        # Only rewrite the model Hermes itself chose for this session. A
+        # different value means a fallback/rotation already switched it, and the
+        # fallback's choice outranks the tier.
+        ctx_model = str(model or "")
+        if ctx_model and current and current != ctx_model:
+            logger.debug(
+                "model-picker: leaving %s in place (session model is %s)", current, ctx_model
+            )
+            return None
+        if current == want:
+            return None
+        want_provider = _tier_provider(tier)
+        if not _provider_matches(want_provider, provider):
+            with _lock:
+                already = _refused.get(sid)
+                _refused[sid] = want_provider
+            if already != want_provider:
+                logger.warning(
+                    "model-picker: tier %s names provider %s but the session runs %s — "
+                    "kept the session model %s (a request middleware cannot move the API "
+                    "host; configure all three tiers on one provider)",
+                    tier,
+                    want_provider,
+                    provider,
+                    current or "-",
+                )
+            return None
+        new_request = dict(request)
+        new_request["model"] = want
+        with _lock:
+            _refused.pop(sid, None)
+        return {
+            "request": new_request,
+            "name": "model-picker",
+            "reason": f"tier={tier}",
+        }
+    except Exception as exc:
+        logger.warning("model-picker: on_llm_request error: %s", exc, exc_info=True)
+        return None
 
 
 def on_pre_llm_call(
@@ -906,6 +545,7 @@ def on_pre_llm_call(
     platform: str = "",
     **kwargs: Any,
 ) -> dict | None:
+    """Rate the turn and record its tier. Applied later by ``on_llm_request``."""
     global _last_user_sid
     try:
         if not _CONFIGURED:
@@ -915,12 +555,9 @@ def on_pre_llm_call(
         sid = session_id or ""
         if (user_message or "").strip():
             # A real user turn anchors which session the human is talking in;
-            # slash commands resolve against this, not the racy _last_bound.
+            # slash commands resolve against this.
             with _lock:
                 _last_user_sid = sid
-        agent = _get_agent(sid)
-        if agent is not None and sid:
-            bind_agent(sid, agent)
 
         with _lock:
             pinned = _pinned.get(sid, False)
@@ -928,9 +565,6 @@ def on_pre_llm_call(
             checkpoint = _checkpoint.get(sid, False)
 
         if pinned:
-            # Still heal half-switch on pinned sessions (WebUI credential refresh).
-            if agent is not None:
-                _apply_tier(agent, current or _TOP)
             if checkpoint:
                 with _lock:
                     _checkpoint[sid] = False
@@ -941,8 +575,6 @@ def on_pre_llm_call(
             # Empty hook payload (tool-call continuation): keep the route
             # coherent, and if an escalation checkpoint is pending, nudge the
             # working model toward escalate_model (one-shot).
-            if agent is not None and current:
-                _apply_tier(agent, current)
             if checkpoint:
                 with _lock:
                     _checkpoint[sid] = False
@@ -954,7 +586,8 @@ def on_pre_llm_call(
         # at the turn boundary so the incoming model cold-reads a summary, not
         # the full history. Explicit pins and escalation take other paths.
         if reason == "classify" and current is not None and current != name:
-            _request_compaction(agent)
+            with _lock:
+                _compact[sid] = True
         with _lock:
             _tool_errors[sid] = 0
             _checkpoint[sid] = False
@@ -967,51 +600,6 @@ def on_pre_llm_call(
     except Exception as exc:
         logger.warning("model-picker: on_pre_llm_call error: %s", exc, exc_info=True)
         return None
-
-
-def on_pre_api_request(*, session_id: str = "", platform: str = "", **kwargs: Any) -> None:
-    """Re-apply route every API call — WebUI credential_refresh half-switches mid-turn."""
-    try:
-        if _should_skip(platform, kwargs):
-            return
-        sid = session_id or ""
-        with _lock:
-            current = _last_tier.get(sid)
-
-        agent = _get_agent(sid)
-        if agent is not None and sid:
-            bind_agent(sid, agent)
-        if agent is None:
-            return
-
-        if current:
-            _apply_tier(agent, current)
-        else:
-            _heal_uncategorized(agent)
-    except Exception as exc:
-        logger.warning("model-picker: on_pre_api_request error: %s", exc, exc_info=True)
-
-
-def _heal_uncategorized(agent: Any) -> None:
-    """No tier classified yet — repair a provider/host half-switch by matching the live model."""
-    prov = _norm(getattr(agent, "provider", "") or "")
-    base = _agent_base_url(agent)
-    if not prov or _base_url_matches_provider(base, prov):
-        return
-    m = _norm(getattr(agent, "model", "") or "")
-    heal = _MID
-    for n, meta in MODELS.items():
-        want = _norm(str(meta.get("model") or ""))
-        if want and (m == want or want in m):
-            heal = n
-            break
-    logger.warning(
-        "model-picker: uncategorized half-switch heal→%s model=%s base=%s",
-        heal,
-        m,
-        base,
-    )
-    _apply_tier(agent, heal)
 
 
 def on_post_tool_call(
@@ -1080,43 +668,30 @@ def on_post_tool_call(
 
 
 def _resolve_cmd_sid() -> str:
-    """Resolve which session a slash command should target.
+    """Which session a slash command should target.
 
     Slash commands are dispatched with only raw_args — no session id — so the
-    plugin must infer the session. Prefer the session of the most recent real
-    user turn (set by on_pre_llm_call), then the last-bound agent, then the
-    CLI manager's agent.
+    plugin infers the session from the most recent real user turn. A pin typed
+    as the very first message of a session falls back to the empty session;
+    ``/high`` sent through the composer instead arrives as a user turn and is
+    detected by ``pre_llm_call`` with the real session id.
     """
     with _lock:
-        if _last_user_sid:
-            return _last_user_sid
-        if _last_bound is not None and _last_bound[0]:
-            return _last_bound[0]
-    agent = _get_agent("")
-    if agent is not None:
-        return getattr(agent, "session_id", "") or ""
-    return ""
+        return _last_user_sid or ""
 
 
 def _cmd_pin(raw_args: str, name: str) -> str:
     del raw_args
     sid = _resolve_cmd_sid()
-    agent = _get_agent(sid) if sid else _get_agent("")
-    if agent is not None and sid:
-        bind_agent(sid, agent)
     meta = MODELS[name]
     with _lock:
         _pinned[sid] = True
     logger.info("model-picker: /%s pin sid=%s", name, sid or "-")
     _set_tier(sid, name, "pin")
-    if agent is not None:
-        return (
-            f"Pinned to {meta['label']} ({meta['provider']} / {meta['model']}). "
-            "Auto-routing paused. /auto to resume."
-        )
+    scope = "this session" if sid else "the next user turn of this session"
     return (
-        f"Pinned to {meta['label']} ({meta['provider']} / {meta['model']}). "
-        "Will apply on the next turn if no live agent was bound."
+        f"Pinned to {meta['label']} ({meta['provider']} / {meta['model']}) for {scope}. "
+        "Auto-routing paused. /auto to resume."
     )
 
 
@@ -1125,32 +700,15 @@ def _cmd_auto(raw_args: str) -> str:
     sid = _resolve_cmd_sid()
     with _lock:
         was = _pinned.pop(sid, False)
-        # Drop cached tier + message so the next turn is classified fresh,
-        # not healed onto the previously pinned model.
+        # Drop cached tier + message so the next turn is classified fresh.
         _last_msg.pop(sid, None)
         _last_tier.pop(sid, None)
         _tool_errors.pop(sid, None)
+        _compact.pop(sid, None)
     logger.info("model-picker: /auto sid=%s was_pinned=%s", sid or "-", was)
     if was:
         return "Auto routing resumed. Next turn is classified automatically."
     return "Auto routing already active."
-
-
-def _deferred_install_capture() -> None:
-    """Install the AIAgent capture once run_agent finishes importing."""
-    for i in range(10):
-        try:
-            _install_agent_capture()
-            logger.info("model-picker: AIAgent capture installed (attempt %d)", i + 1)
-            return
-        except AttributeError:  # run_agent still initializing
-            time.sleep(1.0)
-        except Exception as exc:
-            logger.warning("model-picker: AIAgent capture install failed: %s", exc)
-            return
-    logger.warning(
-        "model-picker: AIAgent capture NOT installed after retries (run_agent never ready)"
-    )
 
 
 ESCALATE_SCHEMA: dict[str, Any] = {
@@ -1200,7 +758,6 @@ def _handle_escalate_model(args: dict | None = None, **kwargs: Any) -> str:
         sid = str(kwargs.get("session_id") or kwargs.get("task_id") or "").strip()
         if not sid:
             sid = _resolve_cmd_sid()
-        agent = _get_agent(sid) if sid else _get_agent("")
         with _lock:
             pinned = _pinned.get(sid, False)
             current = _last_tier.get(sid, _MIN)
@@ -1221,30 +778,23 @@ def _handle_escalate_model(args: dict | None = None, **kwargs: Any) -> str:
             "failure_point": str(args.get("failure_point") or "").strip(),
             "next_hypothesis": str(args.get("next_hypothesis") or "").strip(),
         }
-
-        # Stash the handoff on the context engine so select_context swaps the
-        # next request to a compact handoff (request-scoped, no history mutation).
-        engine = getattr(agent, "context_compressor", None) if agent is not None else None
-        if engine is not None and hasattr(engine, "handoff"):
-            try:
-                engine.handoff = handoff
-            except Exception as exc:
-                logger.warning("model-picker: handoff stash failed: %s", exc)
-        else:
-            logger.warning(
-                "model-picker: no handoff engine on agent — escalation falls back to "
-                "per-model compaction thresholds only"
-            )
-
+        with _lock:
+            _handoff[sid] = handoff
         _set_tier(sid, target, "escalate_model")
         with _lock:
             _tool_errors[sid] = 0
             _checkpoint[sid] = False
         meta = MODELS[target]
+        note = (
+            "The stronger model reads a compact handoff instead of the full "
+            "conversation."
+            if _engine is not None
+            else "The model changed; the transcript is unchanged (the handoff "
+            "context engine is not active on this host)."
+        )
         return (
             f"Escalated to {meta['label']} ({meta.get('provider')}/{meta.get('model')}). "
-            "A handoff summary was prepared so the stronger model can continue without "
-            "re-reading the full conversation."
+            + note
         )
     except Exception as exc:
         logger.warning("model-picker: escalate_model failed: %s", exc, exc_info=True)
@@ -1252,74 +802,92 @@ def _handle_escalate_model(args: dict | None = None, **kwargs: Any) -> str:
 
 
 def _register_escalate_tool(ctx: Any) -> None:
-    kwargs = {
-        "name": "escalate_model",
-        "handler": _handle_escalate_model,
-        "schema": ESCALATE_SCHEMA,
-        "toolset": "plugin",
-        "description": ESCALATE_SCHEMA["description"],
-        "emoji": "🪜",
-    }
+    ctx.register_tool(
+        name="escalate_model",
+        toolset="plugin",
+        schema=ESCALATE_SCHEMA,
+        handler=_handle_escalate_model,
+        description=ESCALATE_SCHEMA["description"],
+        emoji="🪜",
+    )
+
+
+def _host_engine_name() -> str:
+    """``context.engine`` from the host's raw config, or "" when unreadable.
+
+    The host picks a plugin context engine by this name; registering an engine
+    the config does not name would occupy the single public engine slot for
+    nothing, so the registration is gated on it.
+    """
     try:
-        import inspect as _inspect
+        from hermes_cli.config import read_raw_config
 
-        sig = _inspect.signature(ctx.register_tool)
-        params = sig.parameters
-        if any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            ctx.register_tool(**kwargs)
-            return
-        accepted = {
-            name
-            for name, p in params.items()
-            if p.kind
-            in (_inspect.Parameter.POSITIONAL_OR_KEYWORD, _inspect.Parameter.KEYWORD_ONLY)
-        }
-        ctx.register_tool(**{k: v for k, v in kwargs.items() if k in accepted})
-    except TypeError:
-        ctx.register_tool(
-            name="escalate_model",
-            toolset="plugin",
-            schema=ESCALATE_SCHEMA,
-            handler=_handle_escalate_model,
-            description=ESCALATE_SCHEMA["description"],
-            emoji="🪜",
-        )
+        cfg = read_raw_config() or {}
+    except Exception as exc:
+        logger.warning("model-picker: cannot read the host config (%s)", exc)
+        return ""
+    if not isinstance(cfg, dict):
+        return ""
+    context = cfg.get("context")
+    if not isinstance(context, dict):
+        return ""
+    return str(context.get("engine") or "").strip()
 
 
-def _register_engine(ctx: Any) -> None:
+def _load_engine_module() -> Any:
+    try:
+        from . import engine as engine_mod
+
+        return engine_mod
+    except ImportError:
+        path = Path(__file__).with_name("engine.py")
+        spec = importlib.util.spec_from_file_location("model_picker_engine", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
+def _register_engine(ctx: Any, name: str) -> Any | None:
+    """Register the handoff engine — only when the host config names it."""
     if not hasattr(ctx, "register_context_engine"):
         logger.warning("model-picker: ctx has no register_context_engine; handoff disabled")
-        return
+        return None
+    if name != _s.ENGINE_NAME:
+        logger.info(
+            "model-picker: handoff engine not registered (host context.engine=%r, "
+            "not %r)",
+            name or "",
+            _s.ENGINE_NAME,
+        )
+        return None
     try:
-        try:
-            from . import engine as _engine
-        except ImportError:
-            import importlib.util
-            from pathlib import Path
-
-            path = Path(__file__).with_name("engine.py")
-            spec = importlib.util.spec_from_file_location("model_picker_engine", path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"cannot load {path}")
-            _engine = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(_engine)
-        inst = _engine.ModelPickerContextEngine(model="")
+        engine_mod = _load_engine_module()
+    except Exception as exc:
+        logger.warning("model-picker: handoff engine import failed: %s", exc)
+        return None
+    engine_mod.bind_router(take_handoff=_take_handoff, take_compact=_take_compact)
+    try:
+        inst = engine_mod.ModelPickerContextEngine(model="")
         ctx.register_context_engine(inst)
-        logger.info("model-picker: handoff context engine registered (name=%s)", inst.name)
     except Exception as exc:
         logger.warning("model-picker: handoff engine registration failed: %s", exc)
+        return None
+    logger.info("model-picker: handoff context engine registered (name=%s)", inst.name)
+    return inst
 
 
 def register(ctx: Any) -> None:
-    global _manager
-    _manager = getattr(ctx, "_manager", None)
+    """Plugin entry point. Public surfaces only — see the module docstring."""
+    global _ctx, _engine
+    _ctx = ctx
     _attach_file_handler()
-    threading.Thread(target=_deferred_install_capture, daemon=True).start()
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
-    ctx.register_hook("pre_api_request", on_pre_api_request)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_middleware("llm_request", on_llm_request)
     _register_escalate_tool(ctx)
-    _register_engine(ctx)
+    _engine = _register_engine(ctx, _host_engine_name())
     for name in NAMES:
         meta = MODELS[name]
         label = meta.get("label") or name.capitalize()
@@ -1339,7 +907,7 @@ def register(ctx: Any) -> None:
         return
     labels = " / ".join(f"{n} {MODELS[n].get('label')}" for n in NAMES)
     logger.info(
-        "model-picker: %s | escalate≤%s | /low /default /high /auto | no SOUL writes",
+        "model-picker: %s | escalate≤%s | /low /default /high /auto | llm_request middleware",
         labels,
         _ESCALATE_MAX,
     )

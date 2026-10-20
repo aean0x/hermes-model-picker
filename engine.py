@@ -4,17 +4,24 @@ A transparent subclass of Hermes's built-in ``ContextCompressor`` that adds two
 capabilities:
 
 1. Request-scoped context replacement for mid-turn escalation. When the
-   ``escalate_model`` tool fires, it stashes a structured handoff on the live
-   agent's ``context_compressor``; ``select_context`` then swaps the outgoing
-   request for a compact handoff (system prompt + summary + verbatim tail).
+   ``escalate_model`` tool fires, it stashes a structured handoff on the router;
+   ``select_context`` then swaps the outgoing request for a compact handoff
+   (system prompt + summary + verbatim tail).
 2. One-shot forced compaction on a classifier-driven tier change. The router
-   sets ``force_compress_once``; ``should_compress_info`` returns True once so
-   the built-in ``compress()`` runs at the next turn boundary before the
-   incoming model cold-reads the transcript.
+   marks the session; ``should_compress_info`` returns True once, so the
+   built-in ``compress()`` runs at the next turn boundary before the incoming
+   model cold-reads the transcript.
 
 Persisted history is mutated only by the built-in compaction path; the
 escalation handoff is request-only, so prompt cache and the conversation DB
 stay coherent.
+
+The router state lives in the plugin (its hooks and tool own the session
+lifecycle), so the engine reads it through the small ``bind_router`` seam
+instead of reaching into the plugin module. The plugin system holds one shared
+engine instance and hands each agent a deepcopy (``clone_for_agent``), which is
+why the tail budget is instance state and the pending handoff/compaction are
+keyed by session, not stored on the instance.
 
 Every other method is inherited unchanged from ``ContextCompressor``, so normal
 compaction (``should_compress`` / ``compress`` / ``update_model`` /
@@ -23,27 +30,51 @@ compaction (``should_compress`` / ``compress`` / ``update_model`` /
 
 from __future__ import annotations
 
-from typing import Any
+import copy
+import importlib.util
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.context_compressor import ContextCompressor
 
-ENGINE_NAME = "model-picker"
-# Fallback tail budget if the settings module cannot be loaded (roughly 16k
-# tokens at ~4 chars/token). The handoff summary (2-8k tokens) plus this tail
-# lands the total within the 20-30k escalation budget.
-_DEFAULT_TAIL_CHARS = 64000
 
-
-def _load_tail_chars() -> int:
+def _load_settings() -> Any:
     try:
-        from . import settings as _s
+        from . import settings as settings_mod
 
-        return int(getattr(_s, "HANDOFF_TAIL_CHARS", _DEFAULT_TAIL_CHARS))
-    except Exception:
-        return _DEFAULT_TAIL_CHARS
+        return settings_mod
+    except ImportError:
+        path = Path(__file__).resolve().parent / "settings.py"
+        spec = importlib.util.spec_from_file_location("_model_picker_settings", path)
+        if spec is None or spec.loader is None:
+            raise
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
 
 
-def _format_handoff(handoff: dict[str, Any]) -> str:
+_settings = _load_settings()
+
+ENGINE_NAME = _settings.ENGINE_NAME
+_DEFAULT_TAIL_CHARS = _settings.HANDOFF_TAIL_CHARS
+
+# Injected by the plugin at register() time (see the module docstring).
+_TAKE_HANDOFF: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
+_TAKE_COMPACT: Optional[Callable[[str], bool]] = None
+
+
+def bind_router(
+    *,
+    take_handoff: Callable[[str], Optional[Dict[str, Any]]],
+    take_compact: Callable[[str], bool],
+) -> None:
+    """Wire the engine to the router's session-keyed handoff/compaction state."""
+    global _TAKE_HANDOFF, _TAKE_COMPACT
+    _TAKE_HANDOFF = take_handoff
+    _TAKE_COMPACT = take_compact
+
+
+def _format_handoff(handoff: Dict[str, Any]) -> str:
     """Render the structured handoff the escalating model supplied."""
     dest = (handoff.get("to_tier") or "high").strip()
     model = (handoff.get("to_model") or "").strip()
@@ -72,6 +103,32 @@ def _format_handoff(handoff: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _text_of(message: Dict[str, Any]) -> str:
+    """Flatten a message's content to plain text for budget accounting."""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = " ".join(
+            (part.get("text", "") if isinstance(part, dict) else str(part))
+            for part in content
+        )
+    if content is None:
+        return ""
+    return content if isinstance(content, str) else str(content)
+
+
+def _starts_at_turn_boundary(tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop a leading partial tool group so the tail opens on a user message.
+
+    An assistant message carrying ``tool_calls`` must be followed by the tool
+    results that answer it; a tail that starts mid-group is a malformed request
+    for every provider. Trim forward to the first user message instead.
+    """
+    for index, message in enumerate(tail):
+        if message.get("role") == "user":
+            return tail[index:]
+    return tail
+
+
 class ModelPickerContextEngine(ContextCompressor):
     """Built-in compressor plus a request-scoped escalation handoff."""
 
@@ -84,12 +141,17 @@ class ModelPickerContextEngine(ContextCompressor):
     ) -> None:
         super().__init__(*args, model=model, **kwargs)
         self._name = name or ENGINE_NAME
-        self.handoff: dict[str, Any] | None = None
-        self._handoff_tail_chars: int = _load_tail_chars()
-        # One-shot: set by the router on a classifier-driven tier change to
-        # force compaction at the next turn boundary before the new model
-        # cold-reads the conversation. Cleared on first read below.
-        self.force_compress_once: bool = False
+        self._sid: str = ""
+        self._handoff_tail_chars: int = int(_DEFAULT_TAIL_CHARS)
+
+    def clone_for_agent(self) -> "ModelPickerContextEngine":
+        """Per-agent clone; module-level router state is shared, not copied."""
+        return copy.deepcopy(self)
+
+    def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        """Remember which session this instance serves (router state is keyed by it)."""
+        self._sid = session_id or ""
+        super().on_session_start(session_id, **kwargs)
 
     def should_compress_info(
         self, prompt_tokens: int | None = None
@@ -102,10 +164,33 @@ class ModelPickerContextEngine(ContextCompressor):
         bypasses the base cooldown/anti-thrash guards exactly once; every later
         call falls through to the inherited threshold logic.
         """
-        if self.force_compress_once:
-            self.force_compress_once = False
+        take = _TAKE_COMPACT
+        if self._sid and take is not None and take(self._sid):
             return True, None
         return super().should_compress_info(prompt_tokens)
+
+    def _tail(self, source: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Recent verbatim tail, whole messages, charged against the tail budget.
+
+        Messages are carried through unchanged, so ``tool_calls``,
+        ``tool_call_id`` and ``name`` survive the handoff — a rebuilt
+        ``{role, content}`` pair silently orphaned every tool group in the tail.
+        """
+        tail: List[Dict[str, Any]] = []
+        budget = self._handoff_tail_chars
+        for message in reversed(source or []):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "system":
+                continue
+            text = _text_of(message).strip()
+            if not text and not message.get("tool_calls"):
+                continue
+            tail.insert(0, message)
+            budget -= len(text)
+            if budget <= 0:
+                break
+        return _starts_at_turn_boundary(tail)
 
     def select_context(
         self,
@@ -118,14 +203,14 @@ class ModelPickerContextEngine(ContextCompressor):
         """Replace the request with a compact handoff when an escalation is pending.
 
         Returns ``None`` (no-op → byte-identical request, cache preserved) when
-        no handoff is stashed.
+        no handoff is pending for this session.
         """
-        handoff = self.handoff
+        take = _TAKE_HANDOFF
+        handoff = take(self._sid) if (self._sid and take is not None) else None
         if not handoff:
             return None
-        self.handoff = None
         try:
-            out: list[dict[str, Any]] = []
+            out: list[Dict[str, Any]] = []
 
             # Preserve the system prompt verbatim — it carries the stable
             # prefix and the (already-switched) Model:/Provider: footer.
@@ -135,34 +220,9 @@ class ModelPickerContextEngine(ContextCompressor):
 
             out.append({"role": "user", "content": _format_handoff(handoff)})
 
-            # Recent verbatim tail: prefer the live request (includes this
-            # turn's tool loop / failure text) over persisted history.
-            source = request_messages or conversation_messages or []
-            tail: list[dict[str, Any]] = []
-            budget = self._handoff_tail_chars
-            for msg in reversed(source):
-                if not isinstance(msg, dict):
-                    continue
-                role = msg.get("role")
-                if role == "system":
-                    continue
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    content = " ".join(
-                        (c.get("text", "") if isinstance(c, dict) else str(c))
-                        for c in content
-                    )
-                if not isinstance(content, str):
-                    content = str(content)
-                text = content.strip()
-                if not text:
-                    continue
-                tail.insert(0, {"role": role, "content": text})
-                budget -= len(text)
-                if budget <= 0:
-                    break
-
-            out.extend(tail)
+            # Prefer the live request (includes this turn's tool loop / failure
+            # text) over persisted history.
+            out.extend(self._tail(request_messages or conversation_messages or []))
             return out
         except Exception:
             # Fail-open: if handoff construction breaks, fall back to the

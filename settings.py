@@ -28,6 +28,11 @@ from typing import Any
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 
+# Name the host must put in ``context.engine`` for the plugin's handoff engine to
+# be registered (the public engine slot holds one engine, so an unnamed
+# registration would occupy it for nothing).
+ENGINE_NAME = "model-picker"
+
 NAMES: tuple[str, ...] = ("low", "default", "high")
 RANK: dict[str, int] = {"low": 0, "default": 1, "high": 2}
 
@@ -53,6 +58,8 @@ _ENV_ALIASES: dict[str, tuple[str, ...]] = {
     "CLASSIFIER_TIMEOUT_S": (
         "MODEL_PICKER_CLASSIFIER_TIMEOUT_S",
     ),
+    "CLASSIFIER_MODEL": ("MODEL_PICKER_CLASSIFIER_MODEL",),
+    "CLASSIFIER_PROVIDER": ("MODEL_PICKER_CLASSIFIER_PROVIDER",),
 }
 
 
@@ -124,15 +131,10 @@ def _hermes_primary() -> tuple[str, str]:
         provider = ""
     return name.strip(), provider.strip()
 
-# provider -> host heuristics for half-switch repair (model set, old API host).
-DEFAULT_PROVIDER_HOSTS: dict[str, dict[str, list[str]]] = {
-    "deepseek": {"forbid": ["x.ai", "xai"], "prefer": ["deepseek"]},
-    "deepseek-chat": {"forbid": ["x.ai", "xai"], "prefer": ["deepseek"]},
-    "xai": {"forbid": ["deepseek.com"], "prefer": ["x.ai", "xai"]},
-    "xai-oauth": {"forbid": ["deepseek.com"], "prefer": ["x.ai", "xai"]},
-    "x-ai": {"forbid": ["deepseek.com"], "prefer": ["x.ai", "xai"]},
-}
-
+# provider -> host heuristics were removed with the client-surgery path: a
+# request middleware can rewrite the model id but not the API host, so a tier on
+# another provider is refused outright (see __init__.on_llm_request) instead of
+# half-switched and repaired.
 
 class SettingsError(ValueError):
     """Invalid model-picker configuration."""
@@ -248,13 +250,6 @@ def _apply_file(data: dict[str, Any], state: dict[str, Any], *, origin: str) -> 
         state["models"] = _deep_merge(
             state["models"], _coerce_models_map(data["models"], origin=f"{origin}.models")
         )
-    if "provider_hosts" in data and isinstance(data["provider_hosts"], dict):
-        for prov, spec in data["provider_hosts"].items():
-            if isinstance(spec, dict):
-                state["provider_hosts"][str(prov)] = {
-                    "forbid": list(spec.get("forbid") or []),
-                    "prefer": list(spec.get("prefer") or []),
-                }
     if "escalate_max" in data:
         name = as_name(data["escalate_max"])
         if name:
@@ -278,6 +273,10 @@ def _apply_file(data: dict[str, Any], state: dict[str, Any], *, origin: str) -> 
         state["skip_platforms"] = [str(x) for x in data["skip_platforms"]]
     if data.get("classifier_system"):
         state["classifier_system"] = str(data["classifier_system"])
+    if data.get("classifier_model"):
+        state["classifier_model"] = str(data["classifier_model"]).strip()
+    if data.get("classifier_provider"):
+        state["classifier_provider"] = str(data["classifier_provider"]).strip()
     if "handoff_tail_chars" in data:
         state["handoff_tail_chars"] = max(1000, int(data["handoff_tail_chars"]))
     if "classifier_context_chars" in data:
@@ -289,11 +288,16 @@ def _apply_file(data: dict[str, Any], state: dict[str, Any], *, origin: str) -> 
 def load_settings() -> dict[str, Any]:
     state: dict[str, Any] = {
         "models": _slot_shells(),
-        "provider_hosts": deepcopy(DEFAULT_PROVIDER_HOSTS),
         "escalate_max": "high",
         "escalation_errors": {"low": 4, "default": 3},
         "skip_platforms": ["cron", "subagent"],
         "classifier_system": None,
+        # Optional pin for the classifier's own model/provider. Both are passed
+        # to the host's plugin-LLM facade, which refuses an override the operator
+        # has not allowed for this plugin — the classifier then runs on the
+        # active model.
+        "classifier_model": "",
+        "classifier_provider": "",
         "handoff_tail_chars": 64000,
         "classifier_context_chars": 12000,
         # Bounded per-call timeout for the auxiliary tier classifier.  The
@@ -365,6 +369,13 @@ def load_settings() -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
+    env_classifier_model = env_knob("CLASSIFIER_MODEL")
+    if env_classifier_model:
+        state["classifier_model"] = env_classifier_model.strip()
+    env_classifier_provider = env_knob("CLASSIFIER_PROVIDER")
+    if env_classifier_provider:
+        state["classifier_provider"] = env_classifier_provider.strip()
+
     if state["escalate_max"] not in models:
         state["escalate_max"] = "high" if "high" in models else next(iter(models))
 
@@ -385,8 +396,9 @@ MODELS: dict[str, dict[str, Any]] = _SETTINGS["models"]
 ESCALATE_MAX: str = _SETTINGS["escalate_max"]
 ESCALATION_ERRORS: dict[str, int] = _SETTINGS["escalation_errors"]
 SKIP_PLATFORMS: frozenset[str] = frozenset(_SETTINGS["skip_platforms"])
-PROVIDER_HOSTS: dict[str, dict[str, list[str]]] = _SETTINGS["provider_hosts"]
 CLASSIFIER: str = _SETTINGS["classifier_system"]
+CLASSIFIER_MODEL: str = _SETTINGS["classifier_model"]
+CLASSIFIER_PROVIDER: str = _SETTINGS["classifier_provider"]
 HANDOFF_TAIL_CHARS: int = _SETTINGS["handoff_tail_chars"]
 CLASSIFIER_CONTEXT_CHARS: int = _SETTINGS["classifier_context_chars"]
 CLASSIFIER_TIMEOUT_S: float = _SETTINGS["classifier_timeout_s"]
@@ -394,31 +406,3 @@ CLASSIFIER_TIMEOUT_S: float = _SETTINGS["classifier_timeout_s"]
 # Everything stays registered; the router just declines to classify.
 CONFIGURED: bool = bool(_SETTINGS["configured"])
 UNCONFIGURED_SLOTS: tuple[str, ...] = tuple(_SETTINGS["unconfigured"])
-
-
-def webui_models() -> list[dict[str, str]]:
-    out = []
-    for name in NAMES:
-        if name not in MODELS:
-            continue
-        meta = MODELS[name]
-        label = str(meta.get("label") or name.capitalize())
-        out.append(
-            {
-                "cmd": f"/{name}",
-                "label": label,
-                "short": str(meta.get("short") or name.capitalize()),
-                "model": str(meta.get("model") or ""),
-                "title": f"Pin {label}",
-            }
-        )
-    out.append(
-        {
-            "cmd": "/auto",
-            "label": "Auto",
-            "short": "Auto",
-            "model": "",
-            "title": "Resume per-turn routing",
-        }
-    )
-    return out

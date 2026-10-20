@@ -102,9 +102,7 @@ class Defaults(unittest.TestCase):
         self.assertNotIn("Architecture", mod.CLASSIFIER)
         self.assertNotIn("Trivial Q&A", mod.CLASSIFIER)
         self.assertNotIn("Rules:", mod.CLASSIFIER)
-        cmds = [row["cmd"] for row in mod.webui_models()]
-        self.assertEqual(cmds, ["/low", "/default", "/high", "/auto"])
-        labels = [row["label"] for row in mod.webui_models()[:3]]
+        labels = [mod.MODELS[name]["label"] for name in mod.NAMES]
         self.assertEqual(labels, ["Quick", "Standard", "Expert"])
 
     def test_defaults_match_config_json(self) -> None:
